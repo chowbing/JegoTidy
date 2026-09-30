@@ -1,6 +1,6 @@
 // ============================================================================
 // Tweak.xm — 无忧行 (com.cmi.jegotrip) 界面精简 Tweak
-// v0.3.4 —— 「我的」页 + 「电话/消息」页两处运营位一起清；隐藏之后把占的高度收掉
+// v1.0 —— 三条线（移 tab / 拦弹窗 / 清广告）全部落地；广告规则**下沉到类**，不再被 App 重新显示
 // ============================================================================
 // 目标（已与 Shawn 确认）：
 //   1) 把「首页 / 目的地 / 流量」这三个 **tab 从导航栏移除**，App 直接落到剩下的 tab；
@@ -137,6 +137,31 @@
 //        而"新增钩子"正是本项目翻过两次车的那类改动。前三条件能解决就不装。
 //   3) 长按橙色 **T** 现在会**同时**恢复 tab 和我们隐藏过的广告并停手。
 //      因为 `BannerCycleView` 是推断出来的，必须有现场后悔药 —— 不能只靠"改代码重装"。
+//
+// ---------------------------------------------------------------------------
+// v1.0（最终版）：广告规则**下沉到类**，不再被 App 重新显示回来
+// ---------------------------------------------------------------------------
+// v0.3.4 真机的**实测**结论（Shawn 回传的 dump，不是推断）：
+//   · 「我的」页广告已消失 ✅
+//   · 「电话/消息」页那条横幅**还在** ❌，且留下证据链：
+//       [广告收起·页面出现] BannerCycleView → ①自身高度约束→0（原 145）      ← 当时确实收掉了
+//       [广告收起·自证]     BannerCycleView 1.5s 后高度已为 0，收起生效
+//       [广告收起·定时]     BannerCycleView → 无可用高度约束、也不是 frame 布局 ← 又出现了
+//       [广告收起·自证]     BannerCycleViewCell 1.5s 后高度仍为 145 —— 收起未生效
+//       [广告收起·自证]     TBMineBannerCell   1.5s 后高度仍为 155 —— 收起未生效
+//   第二行"定时"那一轮是**关键证据**：收起只在我们刚刚隐藏它时才会被调用，
+//   所以那一刻它一定是 `hidden = NO` —— **App 把隐藏过的广告重新显示回来了。**
+//   → 结论：`hidden = YES` 不是一劳永逸的；靠 1 秒一次的扫掠去追是"竞速"，追不上就白干。
+//
+// v1.0 因此做三件事（第 12c-3 节）：
+//   1) **粘性隐藏**：给白名单里的类加 `layoutSubviews` / `setHidden:` 两份覆写，
+//      每个布局周期重新断言 `hidden = YES`；App 想设回 NO 的那一刻就压回去。
+//      每个类只装一次，装在**子类**上（`class_addMethod`），父实现**按类各存一份**。
+//   2) 修掉 ③ 的排他逻辑：原来 `contentView` 约束一改成功就 return，导致 ④ 永远没机会装 ——
+//      而实测 ③"改成功"≠"生效"（`BannerCycleViewCell` 高度仍是 145）。现在 ③④ 并行。
+//   3) 修正诊断：约束**已经是 0** 时不再误报成"无可用高度约束"（那会把"上一轮已收起"
+//      误判成"收不了"，正是上一条被掩盖的原因）。
+// 长按 T 的后悔药同步扩展到撤销粘性覆写。
 // ============================================================================
 
 #import <UIKit/UIKit.h>
@@ -159,7 +184,7 @@
 // ============================== 配置 ==============================
 
 #define JT_TAG              "JegoTidy"
-#define JT_VERSION          "0.3.4"
+#define JT_VERSION          "1.0"
 #define JT_BUNDLE_ID        "com.cmi.jegotrip"
 
 #define ENABLE_CRASH_LOG         1   // 崩溃取证
@@ -180,6 +205,16 @@
 // 「电话/消息」页那条在**页面中部**（通讯工具和最近记录之间），留白一眼就看出来。
 // 收起机制见 JTCollapseAdSpace()：先试 Auto Layout 高度约束，再试 frame，全部失败就**如实记日志**。
 #define ENABLE_AD_COLLAPSE       1
+
+// v1.0：**粘性隐藏** —— 把"隐藏广告"这条规则从"1 秒追一次"下沉到**类**上。
+// 为什么需要（实测，v0.3.4 真机）：`BannerCycleView` 被隐藏后**又被 App 显示回来了**。
+// 证据是日志里出现了第二次 `[广告收起·定时] BannerCycleView → …` —— 收起只在我们
+// 刚刚隐藏它时才会被调用，所以那一刻它一定是 `hidden = NO`。
+// 靠定时扫掠去追是"竞速"：追得上也难看（用户看到的仍是广告），追不上就是没效果。
+// 机制见第 12c-3 节：给白名单里的类加 `layoutSubviews` / `setHidden:` 两份覆写。
+// 独立开关的理由：它会往 App 的类上加方法（比"改一个视图的 hidden"更深一层），
+// 出问题时要能单独关掉而不牵连 ①②③ 三条线。
+#define ENABLE_AD_STICKY         1
 
 // 保留哪些 tab —— 按 `UITabBarItem.tag`。
 // 实测 tag 与 index 一一对应：1000=首页 1001=目的地 1002=流量 1003=电话·消息 1004=我的
@@ -391,13 +426,15 @@ static NSString *JTWindowRectString(UIView *v);
 static NSString *JTAdCandidateSummary(UIView *root);
 static NSUInteger JTSweepBlockAdsInView(UIView *v, NSUInteger depth, NSUInteger *budget,
                                         NSMutableArray *hiddenNew, NSMutableArray *suspect,
-                                        NSMutableArray *collapseLog);
+                                        NSMutableArray *collapseLog, NSMutableArray *stickyLog);
 static void JTSweepBlockAds(NSString *reason);
 static void JTStartAdSweepTimer(void);
 // v0.3.4：收起占位 + 布局取证 + 后悔药
 static NSString *JTCollapseAdSpace(UIView *v);
 static NSString *JTDescribeLayoutForView(UIView *v);
 static void JTRestoreAds(void);
+// v1.0：粘性隐藏（JTRestoreAds 在前、定义在后，必须前置声明）
+static NSUInteger JTRemoveStickyHide(void);
 
 // v0.3 ② 开屏 / 弹窗判定（第 7 节用到）
 static BOOL JTClassLooksLikeSplashOrPopup(NSString *cn);
@@ -592,6 +629,47 @@ static BOOL JTIsDescendantOf(Class c, Class root) {
         if (k == root) return YES;
     }
     return NO;
+}
+
+// ============================== 3c. "按类转发父实现"的通用回查 ==============================
+//
+// 场景：我们用 `class_addMethod` 在**某个类**上新增了一份覆写（只在该类生效），
+// 覆写内部要调用"父类原本的实现"。这个父实现**必须按类各存一份**，不能用全局单份 ——
+// 反例（真实）：白名单里 4 个是 `UICollectionViewCell` 子类，它们继承的 `layoutSubviews`
+// 来自 `UICollectionViewCell`；若统一取 `[UIView layoutSubviews]` 的 IMP 转发，
+// 就绕过了 `UICollectionViewCell` 自己的布局逻辑，cell 会画错。
+//
+// 用法：安装时用 `JTSafeInstanceMethod(cls, sel)` 取父实现存进 dict（键 = 类指针），
+// 覆写里调用本函数回查。`self` 的实际类可能比安装的类更深（App 有私有子类），
+// 所以从 `self` 的类往上找**第一个自己实现了 sel 的类**，那才是安装点。
+//
+// 与 `[super …]` 的区别：本函数用显式 IMP 调用，不经过消息派发，不可能绕回自己
+// （`objc_msgSendSuper` 需要知道安装点的类，而覆写里拿不到；这正是 2026-09-30
+// 栈溢出闪退的同一种失效模式）。首次解析后按 `self` 的类缓存，后续只是一次字典命中。
+static IMP JTBaseIMPForOwner(id self, SEL sel,
+                             NSMutableDictionary<NSNumber *, NSValue *> *dict, IMP ourHook) {
+    if (!dict) return NULL;
+    Class c = object_getClass(self);
+    if (!c) return NULL;
+    NSNumber *key = @((uintptr_t)c);
+    NSValue *hit = dict[key];
+    if (hit) return (IMP)hit.pointerValue;
+
+    Class owner = Nil;
+    for (Class k = c; k; k = class_getSuperclass(k)) {
+        Method m = JTOwnMethod(k, sel);
+        if (!m) continue;                                  // 这个类没实现，继续往上
+        if (method_getImplementation(m) == ourHook) owner = k;
+        break;                                             // 第一个"自己实现"的类就是它
+    }
+    if (!owner) return NULL;
+
+    Method b = JTSafeInstanceMethod(class_getSuperclass(owner), sel);
+    if (!b) return NULL;
+    IMP base = method_getImplementation(b);
+    // 只在解析成功时缓存 —— 负缓存会让后续永远失败。
+    if (base) dict[key] = [NSValue valueWithPointer:(const void *)base];
+    return base;
 }
 
 // ============================== 3b. hook 安装器 ==============================
@@ -2398,7 +2476,9 @@ static BOOL JTClassIsKnownAdView(NSString *cn) {
 //   继承来的 Method 属于父类，method_setImplementation 一改就波及全 App 每一个 cell。
 //   所以用 class_addMethod 在**子类上新增一份**，只在子类生效；我们的实现内部直接调用
 //   父类那份原始 IMP（不走 [super]，避免消息派发绕回自己）。
-static IMP                       gJTBaseFittingIMP = NULL;
+//
+// ★ 父实现**按类各存一份**（键 = 类指针），见第 3c 节的说明。
+static NSMutableDictionary<NSNumber *, NSValue *> *gJTFittingBase = nil;
 static NSMutableSet<NSString *> *gJTFittingLogged = nil;
 
 static SEL JTFittingSel(void) {
@@ -2410,8 +2490,9 @@ static SEL JTFittingSel(void) {
 //   `s.height > 0.5` **每次布局都为真** —— 不去重就会每次布局刷一行，把诊断缓冲冲掉。
 static id JTPreferredFittingHook(id self, SEL _cmd, id attrs) {
     id a = attrs;
-    if (gJTBaseFittingIMP) {
-        a = ((id (*)(id, SEL, id))gJTBaseFittingIMP)(self, _cmd, attrs);
+    IMP base = JTBaseIMPForOwner(self, _cmd, gJTFittingBase, (IMP)JTPreferredFittingHook);
+    if (base) {
+        a = ((id (*)(id, SEL, id))base)(self, _cmd, attrs);
     }
     @try {
         if ([a isKindOfClass:[UICollectionViewLayoutAttributes class]]) {
@@ -2451,8 +2532,10 @@ static NSString *JTInstallFittingOverride(Class adCell) {
     if (!adCell) return @"类不存在";
     @try {
         SEL sel = JTFittingSel();
-        Method base = JTSafeInstanceMethod([UICollectionViewCell class], sel);
-        if (!base) return @"UICollectionViewCell 上找不到该方法";
+        // ★ 父实现取自 `adCell` **自己的**父类链（不是写死 `[UICollectionViewCell class]`）：
+        //   万一某个类继承自一个覆写了该方法的中间类，写死父类会取到错的那份。
+        Method base = JTSafeInstanceMethod(adCell, sel);
+        if (!base) return @"父类链上找不到该方法";
 
         Method own = JTOwnMethod(adCell, sel);
         if (own) {
@@ -2461,10 +2544,13 @@ static NSString *JTInstallFittingOverride(Class adCell) {
             // 而"一个 selector 挂多个类"正是 2026-09-30 栈溢出闪退的成因（第 3b 节）。
             return @"该类自己实现了该方法，跳过（不动它）";
         }
-        if (!gJTBaseFittingIMP) gJTBaseFittingIMP = method_getImplementation(base);
+        if (!gJTFittingBase) gJTFittingBase = [NSMutableDictionary dictionary];
+        NSNumber *key = @((uintptr_t)adCell);
+        gJTFittingBase[key] = [NSValue valueWithPointer:(const void *)method_getImplementation(base)];
 
         if (!class_addMethod(adCell, sel, (IMP)JTPreferredFittingHook,
                              method_getTypeEncoding(base))) {
+            [gJTFittingBase removeObjectForKey:key];
             return @"class_addMethod 失败";
         }
         return @"已加自撑高覆写";
@@ -2478,14 +2564,25 @@ static NSString *JTInstallFittingOverride(Class adCell) {
 
 // 在 list 里找"把 item 的高度定死"的约束，找到就把 constant 归零，返回原值；没找到返回 0。
 // 两个方向都查：约束里 item 可能是 firstItem，也可能是 secondItem。
-static CGFloat JTZeroHeightIn(NSArray<NSLayoutConstraint *> *list, id item) {
+//
+// ★ `foundAlreadyZero`：找到高度约束但 constant 已经是 0 时置 YES。
+//   为什么需要它 —— 不加的话"约束已是 0"和"根本没有约束"都返回 0，
+//   调用方只能报"无可用高度约束"，把**已经收起过**误报成**收不了**。
+//   v0.3.4 真机就踩了这个坑：定时那一轮报 `BannerCycleView → 无可用高度约束`，
+//   实际是上一轮已经收到 0，只是 App 又把视图显示回来了。
+static CGFloat JTZeroHeightIn(NSArray<NSLayoutConstraint *> *list, id item,
+                              BOOL *foundAlreadyZero) {
+    if (foundAlreadyZero) *foundAlreadyZero = NO;
     if (!list || !item) return 0.0;
     for (NSLayoutConstraint *c in list) {
         BOOL isHeight = (c.firstAttribute == NSLayoutAttributeHeight) ||
                         (c.secondAttribute == NSLayoutAttributeHeight);
         if (!isHeight) continue;
         if (c.firstItem != item && c.secondItem != item) continue;
-        if (c.constant <= 0.5) continue;
+        if (c.constant <= 0.5) {
+            if (foundAlreadyZero) *foundAlreadyZero = YES;
+            continue;   // 继续找 —— 同一个 item 上可能还有另一条非零的高度约束
+        }
         CGFloat old = c.constant;
         c.constant = 0.0;
         return old;
@@ -2501,28 +2598,47 @@ static NSString *JTCollapseAdSpace(UIView *v) {
         BOOL isCell = [v isKindOfClass:[UICollectionViewCell class]] ||
                       [v isKindOfClass:[UITableViewCell class]];
         CGFloat old = 0.0;
+        BOOL zeroed = NO;
 
-        old = JTZeroHeightIn(v.constraints, (id)v);
+        old = JTZeroHeightIn(v.constraints, (id)v, &zeroed);
         if (old > 0.0) return [NSString stringWithFormat:@"①自身高度约束→0（原 %.0f）", (double)old];
+        if (zeroed) return @"①自身高度约束**已是 0**（上一轮已收起，本轮只是视图被 App 重新显示）";
 
         UIView *sup = v.superview;
         if (sup) {
-            old = JTZeroHeightIn(sup.constraints, (id)v);
+            old = JTZeroHeightIn(sup.constraints, (id)v, &zeroed);
             if (old > 0.0) return [NSString stringWithFormat:@"②父视图高度约束→0（原 %.0f）", (double)old];
+            if (zeroed) return @"②父视图里指向它的高度约束**已是 0**（上一轮已收起）";
         }
 
         if (isCell) {
+            // ★ ③ 和 ④ **并行**，不是二选一。
+            //   实测（v0.3.4）：`BannerCycleViewCell` 走 ③ 把 contentView 的高度约束改成 0 之后，
+            //   1.5s 自证显示高度仍是 145 —— **③"改成功"不等于"生效"**：cell 的高度是布局对象
+            //   （flow layout 的 itemSize / delegate）给的，contentView 上的约束管不着。
+            //   原来 ③ 命中就 return，导致 ④ 永远没机会装。现在两条都试，日志如实写两条结果。
+            BOOL z3 = NO;
             id cvObj = [v valueForKey:@"contentView"];
             if ([cvObj isKindOfClass:[UIView class]]) {
                 UIView *content = (UIView *)cvObj;
-                old = JTZeroHeightIn(content.constraints, (id)content);
-                if (old > 0.0) return [NSString stringWithFormat:@"③contentView 高度约束→0（原 %.0f）", (double)old];
+                old = JTZeroHeightIn(content.constraints, (id)content, &z3);
             }
-            // ④ 自撑高覆写。认身份用的是**类名**，不是 indexPath —— 见本节顶部说明。
+
+            // ④ 自撑高覆写。只对 UICollectionViewCell 有意义 —— 那个方法定义在 UICollectionViewCell 上，
+            //   往 UITableViewCell 子类上加一份类型编码对不上的方法是自找麻烦（虽然不会被调用）。
+            //   认身份用的是**类名**，不是 indexPath —— 见本节顶部说明。
             //   注意：只有布局走自撑高（estimatedItemSize 非零）时才会被调用；
             //   不是自撑高时这条路**不会报错也不会生效**，表现为"已加覆写但仍有留白"。
-            return [NSString stringWithFormat:@"④%@（仅自撑高布局生效）",
-                    JTInstallFittingOverride([v class])];
+            NSString *fit = [v isKindOfClass:[UICollectionViewCell class]]
+                                ? JTInstallFittingOverride([v class])
+                                : @"(非 collection cell，④ 不适用)";
+
+            if (old > 0.0) {
+                return [NSString stringWithFormat:@"③contentView 高度约束→0（原 %.0f）＋④%@",
+                        (double)old, fit];
+            }
+            if (z3) return [NSString stringWithFormat:@"③contentView 高度约束**已是 0**＋④%@", fit];
+            return [NSString stringWithFormat:@"③无 contentView 高度约束＋④%@", fit];
         }
 
         if (!v.translatesAutoresizingMaskIntoConstraints) {
@@ -2532,7 +2648,7 @@ static NSString *JTCollapseAdSpace(UIView *v) {
                 return [NSString stringWithFormat:@"frame 高度→0（原 %.0f，纯 frame 布局）", (double)f.size.height];
             }
         }
-        return @"无可用高度约束、也不是 frame 布局（未收起，会留白）";
+        return @"**确实没有**任何高度约束、也不是 frame 布局（未收起，会留白）";
     } @catch (NSException *e) {
         return [NSString stringWithFormat:@"收起异常: %@", e.reason];
     }
@@ -2625,8 +2741,14 @@ static NSString *JTDescribeLayoutForView(UIView *v) {
 // 为什么要这一步：`JTCollapseAdSpace` 返回的"④已加自撑高覆写"只是一句**声明** ——
 // 覆写加上了不等于它被调用过（不是自撑高布局就永远不会被调用）。
 // **声明不是证据。** 所以 1.5 秒后回看这个视图的实际高度：
-// 归零 = 生效；还有高度 = 没生效，下一版必须改走 delegate 的 size 钩子。
-// （1.5s 是为了让布局至少跑完一轮；期间强引用一下这个视图，1.5 秒的持有没有影响。）
+// 归零 = 生效；还有高度 = 没生效。
+//
+// ★ v1.0 起这条日志的含义变了：v0.3.4 真机上它报了两次"未生效"
+//   （`BannerCycleViewCell` / `TBMineBannerCell` 都还是 145/155），
+//   而 v1.0 加了粘性隐藏之后**视图本身不会再露出来** ——
+//   所以"收起未生效"退化成"原地留一块空白"，不再是"广告还在"。
+//   留白仍在时，唯一还没试过的路是 delegate 的 `collectionView:layout:sizeForItemAtIndexPath:`。
+//   （1.5s 是为了让布局至少跑完一轮；期间强引用一下这个视图，1.5 秒的持有没有影响。）
 static void JTScheduleCollapseVerify(UIView *v, NSString *cn) {
     if (!v || cn.length == 0) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
@@ -2634,8 +2756,9 @@ static void JTScheduleCollapseVerify(UIView *v, NSString *cn) {
         @try {
             CGRect f = v.frame;
             if (f.size.height > 0.5) {
-                JTDiag(@"[广告收起·自证] %@ 1.5s 后高度仍为 %.0f —— **收起未生效**，"
-                        "下一版改走 delegate 的 size 钩子（或核对布局是否自撑高）",
+                JTDiag(@"[广告收起·自证] %@ 1.5s 后高度仍为 %.0f —— **收起未生效**"
+                        "（视图已被粘性隐藏，用户看到的是这里留白，不是广告）；"
+                        "剩下唯一没试过的路是 delegate 的 sizeForItemAtIndexPath:",
                        cn, (double)f.size.height);
             } else {
                 JTDiag(@"[广告收起·自证] %@ 1.5s 后高度已为 0，收起生效", cn);
@@ -2665,35 +2788,183 @@ static void JTRestoreAds(void) {
             [gJTHiddenAdViews removeAllObjects];
         }
 
-        // 中和 ④：把广告 cell 类上的覆写换回父类实现
+        // 中和 ④：把广告 cell 类上的自撑高覆写换回**各自的**父类实现
         NSUInteger undone = 0;
-        if (gJTBaseFittingIMP) {
-            static NSString * const kAdCells[] = {
-                @"TBMineBannerCell", @"TBMineBannerItemCell",
-                @"BannerCycleViewCell", @"TripOperatingAdCell",
-            };
+        if (gJTFittingBase.count > 0) {
             SEL sel = JTFittingSel();
-            for (unsigned i = 0; i < sizeof(kAdCells) / sizeof(kAdCells[0]); i++) {
-                Class c = objc_getClass(kAdCells[i].UTF8String);
+            NSArray<NSNumber *> *keys = gJTFittingBase.allKeys;
+            for (NSNumber *key in keys) {
+                Class c = (Class)(uintptr_t)key.unsignedLongLongValue;
                 if (!c) continue;
                 Method own = JTOwnMethod(c, sel);
                 if (!own) continue;
                 if (method_getImplementation(own) != (IMP)JTPreferredFittingHook) continue;
-                method_setImplementation(own, gJTBaseFittingIMP);
+                method_setImplementation(own, (IMP)gJTFittingBase[key].pointerValue);
                 undone++;
             }
+            [gJTFittingBase removeAllObjects];
+            [gJTFittingLogged removeAllObjects];
         }
 
-        JTDiag(@"[广告恢复·手动] 已恢复 %lu 个视图，撤销 %lu 个自撑高覆写；"
+        // 中和 ⑤（粘性隐藏）：把 layoutSubviews / setHidden: 的覆写换回父类实现。
+        // ★ 必须在 gJTAdRuleDisabled = YES **之后**调用 —— 两个覆写内部都会先查这个开关，
+        //   开关没置位就换 IMP，会出现"换回去的瞬间又被旧覆写压回 hidden=YES"的窗口。
+        NSUInteger unsticky = JTRemoveStickyHide();
+
+        JTDiag(@"[广告恢复·手动] 已恢复 %lu 个视图，撤销 %lu 个自撑高覆写、%lu 个粘性覆写；"
                 "本次启动内不再隐藏广告（重开 App 才恢复自动）",
-               (unsigned long)n, (unsigned long)undone);
+               (unsigned long)n, (unsigned long)undone, (unsigned long)unsticky);
     } @catch (NSException *e) {
     }
 }
 
+// ============================== 12c-3. 粘性隐藏（v1.0） ==============================
+//
+// **实测**（2026-09-30 v0.3.4 真机）：`BannerCycleView` 在页面出现时被隐藏，之后**又变成了 [显]**。
+// 证据：日志里出现了**第二次** `[广告收起·定时] BannerCycleView → …`，
+// 而收起只在"我们刚刚隐藏它"时才会被调用 → 那一刻它一定是 `hidden = NO`。
+//
+// 也就是说：**`hidden = YES` 不是一劳永逸的，App 会把它重新显示回来**
+// （cell 复用/重建、轮播刷新、服务端下发新素材都可能）。
+// 靠 1 秒一次的扫掠去追是"竞速"：追得上也难看（用户看到的仍是广告），追不上就是现在这样。
+//
+// 正确做法：**把规则下沉到类上**。给白名单里的类加两份覆写：
+//   · `layoutSubviews` —— 每个布局周期重新断言 `hidden = YES`（兜"新建的 cell 默认不隐藏"）
+//   · `setHidden:`     —— App 把它设回 NO 的**那一刻**就压回去（兜"App 显式重新显示"）
+// 两条路互补，任一条装上就有粘性；两条都装不上（App 自己实现了同名方法）就**如实记日志**。
+//
+// 和 ④ 一样：用 `class_addMethod` 加在**子类**上（`layoutSubviews` / `setHidden:` 都是
+// `UIView` 的方法，改继承来的 Method 会波及全 App 每一个视图），并直接调用父类原始 IMP。
+//
+// ★★ 父类 IMP 必须**按类各存一份**，不能用一个全局。
+//    白名单里 4 个是 `UICollectionViewCell` 子类，它们实际继承的 `layoutSubviews`
+//    **来自 `UICollectionViewCell` 而不是 `UIView`**。如果统一取 `[UIView layoutSubviews]`
+//    的 IMP 去转发，就会**绕过 UICollectionViewCell 自己的布局逻辑** —— cell 会画错。
+//    所以：安装时用 `JTSafeInstanceMethod(c, sel)`（沿 c 的父类链取"真正会被调用的那份"），
+//    存进以**类指针**为键的字典；调用时按 `self` 的实际类回查（复用第 3c 节的通用回查）。
+//
+// ★ 停手开关必须在**覆写内部**检查：长按 T 之后 `gJTAdRuleDisabled = YES`，
+//   覆写立刻变成直通（否则"恢复"会被自己的覆写压回去 —— 用户看到的是"按了没反应"）。
+//   `JTRestoreAds` 也确实是**先**置位、**后**恢复，顺序不能反。
+static NSMutableDictionary<NSNumber *, NSValue *> *gJTStickyBaseLayout = nil;  // 类指针 → 父 layoutSubviews IMP
+static NSMutableDictionary<NSNumber *, NSValue *> *gJTStickyBaseHidden = nil;  // 类指针 → 父 setHidden: IMP
+static NSMutableSet<NSString *> *gJTStickyDone = nil;      // 已尝试过粘性隐藏的类（日志去重）
+
+static void JTStickyLayoutSubviewsHook(id self, SEL _cmd) {
+    IMP base = JTBaseIMPForOwner(self, _cmd, gJTStickyBaseLayout, (IMP)JTStickyLayoutSubviewsHook);
+    if (base) {
+        ((void (*)(id, SEL))base)(self, _cmd);
+    }
+    if (gJTAdRuleDisabled) return;
+    UIView *v = (UIView *)self;
+    // 只在"确实还是显示状态"时才写 —— 否则每次布局都写一遍 hidden，
+    // 有可能把父视图反复标脏（这是唯一可能引起布局循环的写法，必须挡住）。
+    if (!v.hidden) v.hidden = YES;
+}
+
+static void JTStickySetHiddenHook(id self, SEL _cmd, BOOL hidden) {
+    // App 设 NO 就压成 YES；设 YES 原样放行。停手时一律放行。
+    if (!gJTAdRuleDisabled) hidden = YES;
+    IMP base = JTBaseIMPForOwner(self, _cmd, gJTStickyBaseHidden, (IMP)JTStickySetHiddenHook);
+    if (base) {
+        ((void (*)(id, SEL, BOOL))base)(self, _cmd, hidden);
+    }
+}
+
+// 给一个类装粘性隐藏。返回一句人话说明结果（两个方法各自的结果）。
+static NSString *JTInstallStickyHide(Class c) {
+#if ENABLE_AD_STICKY
+    if (!c) return @"类不存在";
+    @try {
+        NSMutableArray<NSString *> *parts = [NSMutableArray array];
+        NSNumber *key = @((uintptr_t)c);
+        if (!gJTStickyBaseLayout) gJTStickyBaseLayout = [NSMutableDictionary dictionary];
+        if (!gJTStickyBaseHidden) gJTStickyBaseHidden = [NSMutableDictionary dictionary];
+
+        // ① layoutSubviews
+        // ★ 父实现取自 `c` 自己的父类链（`JTSafeInstanceMethod(c, …)`），不是 `[UIView class]`。
+        //   `o1 == NULL` 时这个 Method 一定来自某个祖先，正是我们要转发的目标。
+        SEL s1 = @selector(layoutSubviews);
+        Method b1 = JTSafeInstanceMethod(c, s1);
+        Method o1 = JTOwnMethod(c, s1);
+        if (!b1) {
+            [parts addObject:@"layoutSubviews:找不到父实现"];
+        } else if (o1) {
+            [parts addObject:(method_getImplementation(o1) == (IMP)JTStickyLayoutSubviewsHook)
+                                ? @"layoutSubviews:已在" : @"layoutSubviews:App 自己实现，跳过"];
+        } else {
+            gJTStickyBaseLayout[key] = [NSValue valueWithPointer:(const void *)method_getImplementation(b1)];
+            BOOL ok = class_addMethod(c, s1, (IMP)JTStickyLayoutSubviewsHook, method_getTypeEncoding(b1));
+            if (!ok) [gJTStickyBaseLayout removeObjectForKey:key];
+            [parts addObject:ok ? @"layoutSubviews:已加" : @"layoutSubviews:addMethod 失败"];
+        }
+
+        // ② setHidden:
+        SEL s2 = @selector(setHidden:);
+        Method b2 = JTSafeInstanceMethod(c, s2);
+        Method o2 = JTOwnMethod(c, s2);
+        if (!b2) {
+            [parts addObject:@"setHidden:找不到父实现"];
+        } else if (o2) {
+            [parts addObject:(method_getImplementation(o2) == (IMP)JTStickySetHiddenHook)
+                                ? @"setHidden:已在" : @"setHidden:App 自己实现，跳过"];
+        } else {
+            gJTStickyBaseHidden[key] = [NSValue valueWithPointer:(const void *)method_getImplementation(b2)];
+            BOOL ok = class_addMethod(c, s2, (IMP)JTStickySetHiddenHook, method_getTypeEncoding(b2));
+            if (!ok) [gJTStickyBaseHidden removeObjectForKey:key];
+            [parts addObject:ok ? @"setHidden:已加" : @"setHidden:addMethod 失败"];
+        }
+
+        return [parts componentsJoinedByString:@" | "];
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"粘性隐藏异常: %@", e.reason];
+    }
+#else
+    return @"ENABLE_AD_STICKY=0，跳过";
+#endif
+}
+
+// 撤销粘性隐藏：把两个覆写换回**各自的**父类实现。
+// （不删方法 —— 运行时不支持；换回父类 IMP 与"没覆写过"等价。）
+// ★ 换回去之后还要把缓存的 base IMP 清掉：留着的话，万一之后又重新安装，
+//   `JTBaseIMPForOwner` 会命中"已经指向父实现"的旧缓存 —— 值本身仍然正确，
+//   但为了不留下"看起来装过、实际没装"的错觉，统一清空。
+static NSUInteger JTRemoveStickyHide(void) {
+    NSUInteger undone = 0;
+    @try {
+        SEL s1 = @selector(layoutSubviews);
+        SEL s2 = @selector(setHidden:);
+        NSMutableArray<NSString *> *names = [NSMutableArray array];
+        if (gJTStickyDone) [names addObjectsFromArray:gJTStickyDone.allObjects];
+        for (NSString *n in names) {
+            Class c = objc_getClass(n.UTF8String);
+            if (!c) continue;
+            NSNumber *key = @((uintptr_t)c);
+
+            Method m1 = JTOwnMethod(c, s1);
+            NSValue *b1 = gJTStickyBaseLayout[key];
+            if (m1 && b1 && method_getImplementation(m1) == (IMP)JTStickyLayoutSubviewsHook) {
+                method_setImplementation(m1, (IMP)b1.pointerValue);
+                undone++;
+            }
+            Method m2 = JTOwnMethod(c, s2);
+            NSValue *b2 = gJTStickyBaseHidden[key];
+            if (m2 && b2 && method_getImplementation(m2) == (IMP)JTStickySetHiddenHook) {
+                method_setImplementation(m2, (IMP)b2.pointerValue);
+                undone++;
+            }
+        }
+        [gJTStickyBaseLayout removeAllObjects];
+        [gJTStickyBaseHidden removeAllObjects];
+        [gJTStickyDone removeAllObjects];   // 恢复之后允许重新安装
+    } @catch (NSException *e) {
+    }
+    return undone;
+}
+
 static NSUInteger JTSweepBlockAdsInView(UIView *v, NSUInteger depth, NSUInteger *budget,
                                         NSMutableArray *hiddenNew, NSMutableArray *suspect,
-                                        NSMutableArray *collapseLog) {
+                                        NSMutableArray *collapseLog, NSMutableArray *stickyLog) {
     if (!v || depth > (NSUInteger)SWEEP_MAX_DEPTH || !budget || *budget == 0) return 0;
     (*budget)--;
     NSUInteger acted = 0;
@@ -2706,7 +2977,20 @@ static NSUInteger JTSweepBlockAdsInView(UIView *v, NSUInteger depth, NSUInteger 
             if (!gJTHiddenAdViews) gJTHiddenAdViews = [NSHashTable weakObjectsHashTable];
             [gJTHiddenAdViews addObject:v];
 
-            // 隐藏之后立刻收高度 —— 只隐藏会在页面中部留一块空白（见第 12c-2 节）
+            // ① 先上"粘性隐藏"：把规则下沉到**类**上。
+            //    实测 App 会把隐藏过的广告重新显示回来（见第 12c-3 节），
+            //    只靠 1 秒一次的扫掠是竞速，赢不了。每个类只装一次。
+            @synchronized (@"JTAdLog") {
+                if (!gJTStickyDone) gJTStickyDone = [NSMutableSet set];
+                if (![gJTStickyDone containsObject:cn] && gJTStickyDone.count < 40) {
+                    [gJTStickyDone addObject:cn];
+                    Class k = NSClassFromString(cn);
+                    NSString *r = JTInstallStickyHide(k);
+                    [stickyLog addObject:[NSString stringWithFormat:@"%@ → %@", cn, r]];
+                }
+            }
+
+            // ② 再收高度 —— 只隐藏会在页面中部留一块空白（见第 12c-2 节）
             NSString *how = JTCollapseAdSpace(v);
             BOOL firstForThis = NO;
             @synchronized (@"JTAdLog") {
@@ -2744,7 +3028,7 @@ static NSUInteger JTSweepBlockAdsInView(UIView *v, NSUInteger depth, NSUInteger 
 
     for (UIView *c in v.subviews) {
         if (*budget == 0) break;
-        acted += JTSweepBlockAdsInView(c, depth + 1, budget, hiddenNew, suspect, collapseLog);
+        acted += JTSweepBlockAdsInView(c, depth + 1, budget, hiddenNew, suspect, collapseLog, stickyLog);
     }
     return acted;
 }
@@ -2761,15 +3045,20 @@ static void JTSweepBlockAds(NSString *reason) {
         NSMutableArray *hiddenNew = [NSMutableArray array];
         NSMutableArray *suspect = [NSMutableArray array];
         NSMutableArray *collapseLog = [NSMutableArray array];
+        NSMutableArray *stickyLog = [NSMutableArray array];
         NSUInteger acted = 0;
         for (UIWindow *w in app.windows) {
             if ([w isKindOfClass:[JTOverlayWindow class]]) continue;
             NSUInteger budget = SWEEP_NODE_BUDGET;
-            acted += JTSweepBlockAdsInView(w, 0, &budget, hiddenNew, suspect, collapseLog);
+            acted += JTSweepBlockAdsInView(w, 0, &budget, hiddenNew, suspect, collapseLog, stickyLog);
         }
         if (hiddenNew.count > 0) {
             JTDiag(@"[广告清理·%@] 隐藏 %lu 个（本次新命中类：%@）",
                    reason, (unsigned long)acted, [hiddenNew componentsJoinedByString:@", "]);
+        }
+        if (stickyLog.count > 0) {
+            JTDiag(@"[广告粘性·%@] 规则已下沉到类（%@）",
+                   reason, [stickyLog componentsJoinedByString:@" | "]);
         }
         if (collapseLog.count > 0) {
             JTDiag(@"[广告收起·%@] 收高度的结果：%@",

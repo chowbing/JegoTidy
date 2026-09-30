@@ -1,6 +1,6 @@
 Package: com.shawn.jegotidy
 Name: JegoTidy
-Version: 0.3.4
+Version: 1.0
 Architecture: iphoneos-arm64
 Description: 精简无忧行 App 界面：移除「首页/目的地/流量」三个 tab、清掉页面内运营位/广告、拦截开屏与启动弹窗（TrollStore/TrollFools 注入）
 Maintainer: Shawn
