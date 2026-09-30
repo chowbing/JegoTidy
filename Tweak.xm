@@ -1,6 +1,6 @@
 // ============================================================================
 // Tweak.xm — 无忧行 (com.cmi.jegotrip) 界面精简 Tweak
-// v0.3.2 —— 目标 ① 已达成；加 tab bar 深挖诊断，定位残留的凸起装饰
+// v0.3.3 —— 目标 ① 确认达成（残留凸起也消失了）；dump 升级为"能直接指向广告位"
 // ============================================================================
 // 目标（已与 Shawn 确认）：
 //   1) 把「首页 / 目的地 / 流量」这三个 **tab 从导航栏移除**，App 直接落到剩下的 tab；
@@ -14,7 +14,7 @@
 //
 // 使用方式（真机）：
 //   1) 打开 App。右上角两个小圆点（都可拖动）：
-//        · 蓝色 JT —— 点 = 抓当前页并复制；长按 = 复制全部诊断
+//        · 蓝色 JT —— 点 = 抓当前页并复制（含「广告候选汇总」）；长按 = 复制全部诊断
 //        · 橙色 T  —— 点 = 手动再应用一次 tab 规则；长按 = **恢复原始 5 个 tab 并停手**
 //   2) 正常用一遍：切切 tab、进各页面、把启动时看到的弹窗复现一次。
 //   3) **长按 JT** → 完整诊断写进剪贴板 → 粘贴回来。
@@ -93,6 +93,28 @@
 // 但导航栏中间仍可见"凸起圆点的上半部分"。**直接子视图清单看不出它是什么**
 // （所有槽位装饰都已经 [隐]），所以新增第 6c 节的 tab bar 深挖：
 // 子树（深度 3）+ 非视图的 CALayer + tab bar 的兄弟视图，三样一起打，只在长按 JT 时输出。
+//
+// ---------------------------------------------------------------------------
+// v0.3.3：目标 ① 收官，dump 升级为"能直接指向广告位"
+// ---------------------------------------------------------------------------
+// 用户反馈（v0.3.2 真机）：中间那个圆**已经不见了** —— 目标 ① 到此为止，不再追。
+// 新任务：**「我的」页底部的图片广告**要一并清掉。
+//
+// 上一版的 dump 用来找广告是不够用的，所以这一版**只改诊断、不改行为**：
+//   1) dump 上限 8 层/500 节点 → 12 层/1500 节点。
+//      「我的」页是表格型长页面，窗口→根VC→容器→表格→cell→contentView→卡片→图片
+//      就已经 7 层，横向还有几十个 cell，500 节点会在到达底部广告位之前耗尽。
+//      dump 是**用户点一下才跑一次**，加大没有性能风险。
+//   2) 每个节点补 **窗口坐标** `win=(x,y,w,h)`。
+//      原来只有相对父视图的 frame —— "屏幕底部那条广告"到底是哪个节点，
+//      得自己把整条父链的 origin 加一遍，节点一多必然算错，算错就会改错节点。
+//   3) 每个节点打标：`★★已知广告位` / `★广告嫌疑` / `[H5]`。
+//      `[H5]` 这一条尤其重要 —— 无忧行是原生 + H5 混合，**原生方案对 H5 内部元素完全无效**，
+//      H5 里画的广告在原生树上只是个 `WKContentView`。一眼看出"在不在 H5 里"，
+//      才能避免白改一版。
+//   4) 新增「广告候选汇总」：只挑"已知广告类 / 类名可疑 / 横幅形态图片视图"三类，
+//      带窗口坐标单独列一段。★ 它只**报告**，不隐藏 —— 关键词判定误报率高，
+//      直接拿它去藏视图，就是把"猜"写进了产品行为里。判定由人做，改由下一版做。
 // ============================================================================
 
 #import <UIKit/UIKit.h>
@@ -115,7 +137,7 @@
 // ============================== 配置 ==============================
 
 #define JT_TAG              "JegoTidy"
-#define JT_VERSION          "0.3.2"
+#define JT_VERSION          "0.3.3"
 #define JT_BUNDLE_ID        "com.cmi.jegotrip"
 
 #define ENABLE_CRASH_LOG         1   // 崩溃取证
@@ -146,9 +168,23 @@ static const NSInteger JTKeepTags[] = { 1003, 1004 };
 #define SWEEP_NODE_BUDGET   3000
 #define SWEEP_INTERVAL_SEC  1.0
 
-#define DUMP_MAX_DEPTH      8
-#define DUMP_MAX_NODES      500
+// dump 参数（v0.3.3 上调）。
+// 为什么上调：v0.3.2 的 500 节点 / 8 层是为"看清 tab bar"定的，而「我的」页是
+// 表格型长页面 —— 窗口 → 根VC → 容器 → 表格 → cell → contentView → 卡片 → 图片，
+// 光到图片就 7 层，横向还有几十个 cell，500 节点很容易在到达底部广告位之前就耗尽。
+// dump 是**用户点一下才跑一次**，不是定时任务，加大没有性能风险。
+#define DUMP_MAX_DEPTH      12
+#define DUMP_MAX_NODES      1500
 #define DIAG_CAP            200000
+
+// 「像广告的图片」判定阈值（只用于**报告**，不用于隐藏）：
+// 横幅类广告的形态是"宽、矮、贴边"，这里把宽 ≥150pt、高 ≥30pt、宽高比 1.8~8 的
+// 图片视图列为候选。阈值故意放宽 —— 这一步只负责"别漏"，判由人来做。
+#define AD_CAND_MIN_W       150.0
+#define AD_CAND_MIN_H       30.0
+#define AD_CAND_MIN_RATIO   1.8
+#define AD_CAND_MAX_RATIO   8.0
+#define AD_CAND_MAX_REPORT  20
 
 // ============================== 全局（全部前置，避免"先用后定义"） ==============================
 
@@ -313,6 +349,10 @@ static void JTScheduleTabRuleReapply(void);
 
 // v0.3 ③ 广告扫掠（第 12c 节）
 static BOOL JTClassIsKnownAdView(NSString *cn);
+static BOOL JTClassLooksLikeAdSuspect(NSString *cn);
+// 第 5 节 dump 里要给"广告嫌疑节点"打标，所以这两个判定必须前置声明。
+static NSString *JTWindowRectString(UIView *v);
+static NSString *JTAdCandidateSummary(UIView *root);
 static NSUInteger JTSweepBlockAdsInView(UIView *v, NSUInteger depth, NSUInteger *budget,
                                         NSMutableArray *hiddenNew, NSMutableArray *suspect);
 static void JTSweepBlockAds(NSString *reason);
@@ -615,12 +655,64 @@ static void JTReadBackCrashLog(void) {
 
 // ============================== 5. 视图树 dump ==============================
 
+// 把节点 frame 换算到**窗口坐标**。
+//
+// ★ 为什么必须加（v0.3.3）：dump 里的 frame 是**相对父视图**的，而用户看到的是
+// "屏幕底部有一条广告"。父坐标系里的 (0, 400, 430, 80) 到底是屏幕的哪一块，
+// 得自己在脑子里把整条父链的 origin 加一遍 —— 节点一多就会算错，算错就会改错节点。
+// 换成窗口坐标后，"y 接近屏幕高、宽接近屏宽、高 60~120" 这种特征一眼可辨。
+static NSString *JTWindowRectString(UIView *v) {
+    if (!v) return @"";
+    @try {
+        UIWindow *win = v.window;
+        if (!win) return @" win=(无窗口)";
+        CGRect r = [v convertRect:v.bounds toView:win];
+        return [NSString stringWithFormat:@" win=(%.0f,%.0f,%.0f,%.0f)",
+                (double)r.origin.x, (double)r.origin.y,
+                (double)r.size.width, (double)r.size.height];
+    } @catch (NSException *ignored) {
+        return @"";
+    }
+}
+
+// 判断节点是否落在 H5 里（祖先里有 WKWebView / UIWebView）。
+//
+// ★ 为什么要标（v0.3.3）：无忧行是原生 + H5 混合。**原生方案对 H5 内部元素完全无效** ——
+// H5 里画的广告在原生视图树上只是一个 `WKContentView`，藏它等于藏整个网页。
+// 所以 dump 里必须能一眼看出"这条广告在不在 H5 里"，否则会白改一版。
+static BOOL JTIsInsideWebView(UIView *v) {
+    @try {
+        UIView *p = v;
+        NSUInteger guard = 0;
+        while (p && guard++ < 64) {
+            NSString *cn = NSStringFromClass([p class]);
+            if ([cn hasPrefix:@"WKWebView"] || [cn hasPrefix:@"WKContentView"] ||
+                [cn hasPrefix:@"UIWebView"] || [cn hasPrefix:@"WKScrollView"]) {
+                return YES;
+            }
+            p = p.superview;
+        }
+    } @catch (NSException *ignored) {
+    }
+    return NO;
+}
+
 static NSString *JTDescribeNode(UIView *v) {
     NSMutableString *s = [NSMutableString string];
     CGRect f = v.frame;
     [s appendFormat:@"%@ (%.0f,%.0f,%.0f,%.0f)",
         NSStringFromClass([v class]),
         (double)f.origin.x, (double)f.origin.y, (double)f.size.width, (double)f.size.height];
+
+    [s appendString:JTWindowRectString(v)];
+
+    NSString *cn = NSStringFromClass([v class]);
+    if (JTClassIsKnownAdView(cn)) {
+        [s appendString:@" ★★已知广告位"];
+    } else if (JTClassLooksLikeAdSuspect(cn)) {
+        [s appendString:@" ★广告嫌疑"];
+    }
+    if (JTIsInsideWebView(v)) [s appendString:@" [H5]"];
 
     NSString *aid = v.accessibilityIdentifier;
     if (aid.length) [s appendFormat:@" id=%@", aid];
@@ -712,6 +804,90 @@ static UIViewController *JTCurrentVC(void) {
     }
 }
 
+// ---- 广告候选汇总（v0.3.3）----
+//
+// 完整 dump 动辄上千行，人眼要在里面找"屏幕底部那条广告"很容易看漏 —— 尤其表格型页面，
+// 几十个 cell 的类名高度相似。所以额外做一次**定向收集**：只挑"已知广告类 / 类名可疑 /
+// 横幅形态的图片视图"这三类，用窗口坐标列出来。
+//
+// ★ 这一段只**报告**，不做任何修改。判定由人来做 —— 关键词判定误报率高，
+//   直接拿它去藏视图，就是把"猜"写进了产品行为里。
+static void JTCollectAdCandidates(UIView *v, NSUInteger depth, NSUInteger maxDepth,
+                                  NSUInteger *budget, NSMutableArray<NSString *> *out) {
+    if (!v || !budget || *budget == 0) return;
+    if (out.count >= AD_CAND_MAX_REPORT) return;
+    if (v.hidden || v.alpha < 0.02) return;
+    CGRect f = v.frame;
+    if (f.size.width < 1.0 || f.size.height < 1.0) return;
+    (*budget)--;
+
+    NSString *cn = NSStringFromClass([v class]);
+    NSString *why = nil;
+    if (JTClassIsKnownAdView(cn)) {
+        why = @"已知广告位";
+    } else if (JTClassLooksLikeAdSuspect(cn)) {
+        why = @"类名嫌疑";
+    } else if ([v isKindOfClass:[UIImageView class]]) {
+        CGFloat w = f.size.width;
+        CGFloat h = f.size.height;
+        if (w >= AD_CAND_MIN_W && h >= AD_CAND_MIN_H) {
+            CGFloat ratio = w / h;
+            if (ratio >= AD_CAND_MIN_RATIO && ratio <= AD_CAND_MAX_RATIO) why = @"横幅图片形态";
+        }
+    }
+    if (why) {
+        [out addObject:[NSString stringWithFormat:@"    [%@] %@", why, JTDescribeNode(v)]];
+    }
+
+    if (depth >= maxDepth) return;
+    for (UIView *sub in v.subviews) {
+        if (*budget == 0) break;
+        JTCollectAdCandidates(sub, depth + 1, maxDepth, budget, out);
+    }
+}
+
+static NSString *JTAdCandidateSummary(UIView *root) {
+    NSMutableArray<NSString *> *items = [NSMutableArray array];
+
+    // 第一优先：当前 VC 的视图树。
+    // 为什么它优先于"遍历窗口"：`JTCurrentVC` 有 `gJTLastVC` 兜底 —— 实测存在
+    // "整屏页面由 App 自己的容器呈现、从 UIApplication.windows 这条链走不到" 的情况，
+    // 那种时候只有 gJTLastVC 认得出来。
+    @try {
+        NSUInteger budget = DUMP_MAX_NODES;
+        if (root) JTCollectAdCandidates(root, 0, DUMP_MAX_DEPTH, &budget, items);
+    } @catch (NSException *ignored) {
+    }
+
+    // 兜底：当前 VC 树里零命中时，把**所有可见窗口**再扫一遍。
+    // 这一层是给"广告根本不在页面里"准备的 —— 比如独立浮层窗口挂的横幅。
+    // 只在零命中时才扫，避免和第一遍的结果重复。
+    if (items.count == 0) {
+        @try {
+            for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                if ([w isKindOfClass:[JTOverlayWindow class]]) continue;
+                if (w.hidden || w.alpha < 0.02) continue;
+                NSUInteger budget = DUMP_MAX_NODES;
+                JTCollectAdCandidates(w, 0, DUMP_MAX_DEPTH, &budget, items);
+                if (items.count > 0) break;
+            }
+        } @catch (NSException *ignored) {
+        }
+    }
+
+    NSMutableString *s = [NSMutableString string];
+    if (items.count == 0) {
+        [s appendString:@"    (零命中 —— 这条广告既不是已知广告类，也不是原生横幅图片，"
+                     "也不在任何可见窗口里。优先怀疑：H5 内绘制、或直接 addSublayer: 的 CALayer)\n"];
+        return s;
+    }
+    for (NSString *line in items) [s appendFormat:@"%@\n", line];
+    if (items.count >= AD_CAND_MAX_REPORT) {
+        [s appendFormat:@"    …(已到上限 %d 条，可能还有)\n", AD_CAND_MAX_REPORT];
+    }
+    return s;
+}
+
 static NSString *JTDumpCurrentScreen(void) {
     NSMutableString *out = [NSMutableString string];
     [out appendFormat:@"===== 屏幕 dump %@ =====\n", [NSDate date]];
@@ -751,6 +927,25 @@ static NSString *JTDumpCurrentScreen(void) {
         }
     } @catch (NSException *e) {
         [out appendFormat:@"(当前VC dump 异常: %@)\n", e.reason];
+    }
+
+    // 广告候选汇总：把"最像广告"的节点单独拎出来（带窗口坐标），方便和用户截图对照。
+    @try {
+        UIViewController *cur = JTCurrentVC();
+        UIView *root = cur.view;
+        if (!root) {
+            for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                if ([w isKindOfClass:[JTOverlayWindow class]]) continue;
+                if (w.hidden || w.alpha < 0.02) continue;
+                root = w;
+                break;
+            }
+        }
+        [out appendFormat:@"--- 广告候选汇总（当前页 %@）\n",
+            cur ? NSStringFromClass([cur class]) : @"(未定位)"];
+        [out appendString:JTAdCandidateSummary(root)];
+    } @catch (NSException *e) {
+        [out appendFormat:@"(广告候选汇总异常: %@)\n", e.reason];
     }
 
     // tab bar 的实时状态每次都带上 —— 这是本次任务的核心信息
@@ -2378,7 +2573,7 @@ static void JTInstallFloatButton(void) {
         gJTButton = b;
         gJTRmButton = rm;
         gJTBtnHandler = h;   // 必须持有：target-action 不 retain target
-        JTDiag(@"[悬浮按钮] 已安装（JT=抓取/长按全量；T=手动应用 tab 规则/长按恢复）");
+        JTDiag(@"[悬浮按钮] 已安装（JT=抓取当前页/长按全量；T=手动应用 tab 规则/长按恢复）");
     } @catch (NSException *e) {
         JTDiag(@"[悬浮按钮] 安装异常: %@", e.reason);
     }
