@@ -112,7 +112,13 @@ static __weak UIViewController          *gJTLastVC = nil;
 
 static UIWindow *gJTOverlay = nil;
 static UIButton *gJTButton = nil;
+static UIButton *gJTRmButton = nil;
 static id        gJTBtnHandler = nil;
+
+// 「逐个移除 tab」实验的状态（见文件末尾第 14 节）
+static NSArray  *gJTSavedVCs = nil;   // 原始 viewControllers
+static NSInteger gJTSavedSel = 0;     // 原始 selectedIndex
+static int       gJTProbeCursor = 0;  // 0..count-1 逐个试，== count 时只恢复
 
 static NSString *gJTLastTabDesc = nil;
 
@@ -148,7 +154,14 @@ static UIViewController *JTCurrentVC(void);
 
 static NSArray *JTChildrenOf(UIViewController *vc);
 static void JTCollectTabBars(UIViewController *vc, NSMutableArray *out, NSUInteger depth);
+static void JTCountClasses(UIView *v, NSUInteger depth,
+                           NSUInteger *btn, NSUInteger *img, NSUInteger *lbl);
+static void JTCollectLabels(UIView *v, NSUInteger depth, NSMutableArray *out);
+static NSString *JTVCChainOf(id vc, NSUInteger maxDepth);
+static void JTDescribeTabBarSubviews(UITabBar *tb, NSMutableString *s);
 static NSString *JTDescribeTabBar(UITabBarController *tbc);
+static UITabBarController *JTFindTabBarController(void);
+static void JTProbeRemoveTab(void);
 static NSString *JTDescribeAllTabBars(void);
 static NSString *JTDescribeVCArray(NSArray *arr);
 static void JTSetVCsHook(id self, SEL _cmd, NSArray *vcs);
@@ -205,6 +218,7 @@ static void JTLogTabBarState(NSString *reason);
 - (void)onTap:(UIButton *)sender;
 - (void)onLong:(UILongPressGestureRecognizer *)g;
 - (void)onPan:(UIPanGestureRecognizer *)g;
+- (void)onProbe:(UIButton *)sender;
 @end
 
 // ============================== 1. 阶段标记 ==============================
@@ -663,6 +677,91 @@ static void JTCollectTabBars(UIViewController *vc, NSMutableArray *out, NSUInteg
     JTCollectTabBars(vc.presentedViewController, out, depth + 1);
 }
 
+// ============================== 6b. tab 识别（2026-09-30 第二轮） ==============================
+//
+// 为什么需要这一块：第一轮 dump 拿到的信息**不足以决定删哪个 tab**。
+//   - 5 个 tab 的 VC 类名全是 `BaseNavigationController`（一模一样）→ 不能按类名认
+//   - `UITabBarItem.title` 全是空的 → 不能按标题认
+//   - 可见文字是 App 自绘的 `FLAnimatedImageView` 里的 `UILabel`，只有 4 个
+//     （首页 / 目的地 / 电话·消息 / 我的），第 5 个（index 2）是凸起大图标、没有文字
+// 所以这里补三样东西，用来把 index 和"人看到的那个 tab"对上号：
+//   1) 每个 tab 的 VC **子链**（BaseNavigationController > 真正的页面类）
+//   2) 每个 item 的 accessibilityLabel（App 常常在这里写了名字）
+//   3) tab bar 直接子视图逐条列出（下标 = 自绘顺序 = 视觉从左到右）+ 内含文字
+
+static void JTCountClasses(UIView *v, NSUInteger depth,
+                           NSUInteger *btn, NSUInteger *img, NSUInteger *lbl) {
+    if (!v || depth > 4) return;
+    NSString *cn = NSStringFromClass([v class]);
+    if ([cn isEqualToString:@"UITabBarButton"] && btn) (*btn)++;
+    if ([cn hasPrefix:@"FLAnimatedImageView"] && img) (*img)++;
+    if ([v isKindOfClass:[UILabel class]] && lbl) (*lbl)++;
+    for (UIView *c in v.subviews) JTCountClasses(c, depth + 1, btn, img, lbl);
+}
+
+static void JTCollectLabels(UIView *v, NSUInteger depth, NSMutableArray *out) {
+    if (!v || !out || depth > 4) return;
+    if ([v isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)v).text;
+        if (t.length) [out addObject:t];
+    }
+    for (UIView *c in v.subviews) JTCollectLabels(c, depth + 1, out);
+}
+
+// VC 链：BaseNavigationController > 真正的页面类 > …（最多 maxDepth 层）
+// 一律走 KVC，不用点语法 —— 这个 App 的页面类千奇百怪，点语法随时可能碰上
+// SDK 没暴露的成员（见 Gotcha 20）。
+static NSString *JTVCChainOf(id vc, NSUInteger maxDepth) {
+    NSMutableString *s = [NSMutableString string];
+    id cur = vc;
+    for (NSUInteger i = 0; i < maxDepth && cur; i++) {
+        if (i) [s appendString:@" > "];
+        [s appendString:NSStringFromClass([cur class])];
+        id next = nil;
+        @try {
+            if ([cur isKindOfClass:[UINavigationController class]]) {
+                id vcs = [cur valueForKey:@"viewControllers"];
+                if ([vcs isKindOfClass:[NSArray class]] && [(NSArray *)vcs count] > 0) {
+                    next = [(NSArray *)vcs lastObject];
+                }
+            }
+            if (!next && [cur isKindOfClass:[UIViewController class]]) {
+                NSArray *ch = JTChildrenOf((UIViewController *)cur);
+                if (ch.count > 0) next = ch.firstObject;
+            }
+        } @catch (NSException *ignored) {
+        }
+        cur = next;
+    }
+    return s;
+}
+
+static void JTDescribeTabBarSubviews(UITabBar *tb, NSMutableString *s) {
+    if (!tb) return;
+    NSUInteger btn = 0, img = 0, lbl = 0;
+    JTCountClasses(tb, 0, &btn, &img, &lbl);
+    [s appendFormat:@"    自绘清单: UITabBarButton=%lu  FLAnimatedImageView=%lu  UILabel=%lu  直接子视图=%lu\n",
+        (unsigned long)btn, (unsigned long)img, (unsigned long)lbl,
+        (unsigned long)tb.subviews.count];
+
+    NSUInteger i = 0;
+    for (UIView *sv in tb.subviews) {
+        NSString *aid = sv.accessibilityIdentifier;
+        NSString *alb = sv.accessibilityLabel;
+        NSMutableArray *texts = [NSMutableArray array];
+        JTCollectLabels(sv, 0, texts);
+        [s appendFormat:@"      子[%lu] %@ (%.0f,%.0f,%.0f,%.0f)%@%@%@\n",
+            (unsigned long)i, NSStringFromClass([sv class]),
+            (double)sv.frame.origin.x, (double)sv.frame.origin.y,
+            (double)sv.frame.size.width, (double)sv.frame.size.height,
+            aid.length ? [NSString stringWithFormat:@" id=%@", aid] : @"",
+            alb.length ? [NSString stringWithFormat:@" label=%@", alb] : @"",
+            texts.count ? [NSString stringWithFormat:@" 文字=[%@]",
+                           [texts componentsJoinedByString:@"/"]] : @""];
+        i++;
+    }
+}
+
 static NSString *JTDescribeTabBar(UITabBarController *tbc) {
     NSMutableString *s = [NSMutableString string];
     if (!tbc) return @"(nil)\n";
@@ -673,9 +772,11 @@ static NSString *JTDescribeTabBar(UITabBarController *tbc) {
     NSUInteger i = 0;
     for (UIViewController *vc in tbc.viewControllers) {
         UITabBarItem *it = vc.tabBarItem;
-        [s appendFormat:@"    [%lu] %@   title=%@  tag=%ld  badge=%@\n",
+        [s appendFormat:@"    [%lu] %@   title=%@  tag=%ld  badge=%@  a11y=%@\n",
             (unsigned long)i, NSStringFromClass([vc class]),
-            it.title ?: @"(无)", (long)it.tag, it.badgeValue ?: @"(无)"];
+            it.title ?: @"(无)", (long)it.tag, it.badgeValue ?: @"(无)",
+            it.accessibilityLabel ?: @"(无)"];
+        [s appendFormat:@"        链: %@\n", JTVCChainOf(vc, 4)];
         i++;
     }
 
@@ -689,12 +790,41 @@ static NSString *JTDescribeTabBar(UITabBarController *tbc) {
             (unsigned long)tb.items.count];
         NSUInteger j = 0;
         for (UITabBarItem *it in tb.items) {
-            [s appendFormat:@"      item[%lu] title=%@ tag=%ld\n",
-                (unsigned long)j, it.title ?: @"(无)", (long)it.tag];
+            [s appendFormat:@"      item[%lu] title=%@ tag=%ld a11y=%@\n",
+                (unsigned long)j, it.title ?: @"(无)", (long)it.tag,
+                it.accessibilityLabel ?: @"(无)"];
             j++;
         }
+        JTDescribeTabBarSubviews(tb, s);
     }
     return s;
+}
+
+// 找当前活着的 UITabBarController。两条路都走：
+// 窗口树（root → presented → children）常常到不了 App 自己的容器，
+// 所以再用我们自己登记的 VC 兜底 —— 这一点第一轮已经实测验证过是必要的。
+static UITabBarController *JTFindTabBarController(void) {
+    NSMutableArray *found = [NSMutableArray array];
+    @try {
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if ([w isKindOfClass:[JTOverlayWindow class]]) continue;
+            JTCollectTabBars(w.rootViewController, found, 0);
+        }
+        @synchronized (@"JTVC") {
+            if (gJTVCLive) {
+                for (UIViewController *vc in gJTVCLive.allObjects) {
+                    if ([vc isKindOfClass:[UITabBarController class]] && ![found containsObject:vc]) {
+                        [found addObject:vc];
+                    }
+                }
+            }
+        }
+    } @catch (NSException *ignored) {
+    }
+    // 不用三元：`cond ? (Typed *)x : nil` 在 ObjC++ 下会把结果类型推成 id，
+    // 虽然能过，但正是 objcpp.py 盯着的那类"ObjC 合法、ObjC++ 危险"的写法。显式分支最稳。
+    if (found.count == 0) return nil;
+    return (UITabBarController *)found[0];
 }
 
 static NSString *JTDescribeAllTabBars(void) {
@@ -1187,6 +1317,80 @@ static void JTLaunchGuardReset(void) {
     }
 }
 
+// ============================== 12b. 「逐个移除 tab」实验 ==============================
+//
+// 为什么做成"点一下试一个"，而不是直接写死 v0.3 的移除规则：
+//
+// 未知 1 —— **「流量」对应哪个 index 还没确认。**
+//   第一轮 dump 里 5 个 tab 的 VC 类名**全是** BaseNavigationController，
+//   UITabBarItem.title 全是空，可见文字只有 4 个（首页/目的地/电话·消息/我的），
+//   剩下 index 2 是凸起大图标、没有文字。只能靠"移除它、看屏幕上哪个消失"来确定。
+//
+// 未知 2 —— **过滤 viewControllers 之后，App 自绘的图标会不会跟着走。**
+//   JegoTabBar 是 App 自己子类化的 UITabBar，那 5 个 FLAnimatedImageView 是它自绘的，
+//   真正的 UITabBarButton 在下面一层。如果自绘图标不跟着 items 重建，
+//   光过滤 viewControllers 会留下"幽灵图标"，v0.3 就得换一条路（直接操作自绘子视图）。
+//   这一条直接决定实现路径，必须实测。
+//
+// 做成"每次只移除一个 + 每次先完整恢复"的顺序实验，一轮同时回答这两个问题。
+// 关键安全属性：**只在点击时发生** —— 不动启动路径，试错了重新打开 App 就恢复，
+// 所以任何一步都不可能把"App 能正常打开"这个已经拿到的成果弄丢。
+static void JTProbeRemoveTab(void) {
+    @try {
+        UITabBarController *tbc = JTFindTabBarController();
+        if (!tbc) {
+            JTDiag(@"[实验] 找不到 UITabBarController");
+            return;
+        }
+
+        // 第一次点击时记录原始状态；之后每次实验都从这里恢复，保证每次都从干净状态开始
+        if (!gJTSavedVCs) {
+            gJTSavedVCs = [tbc.viewControllers copy];
+            gJTSavedSel = tbc.selectedIndex;
+            JTDiag(@"[实验] 已记录原始状态：%lu 个 tab，selectedIndex=%ld",
+                   (unsigned long)gJTSavedVCs.count, (long)gJTSavedSel);
+        }
+        if (gJTSavedVCs.count == 0) {
+            JTDiag(@"[实验] 原始 viewControllers 为空，无法实验");
+            return;
+        }
+
+        // 1) 先完整恢复
+        [tbc setViewControllers:gJTSavedVCs animated:NO];
+        if (gJTSavedSel < (NSInteger)gJTSavedVCs.count) tbc.selectedIndex = gJTSavedSel;
+        JTDiag(@"\n===== [实验] 恢复后 =====\n%@", JTDescribeTabBar(tbc));
+
+        int idx = gJTProbeCursor;
+        gJTProbeCursor++;
+        if (gJTProbeCursor > (int)gJTSavedVCs.count) gJTProbeCursor = 0;
+
+        if (idx < (int)gJTSavedVCs.count) {
+            NSMutableArray *m = [gJTSavedVCs mutableCopy];
+            [m removeObjectAtIndex:(NSUInteger)idx];
+            [tbc setViewControllers:m animated:NO];
+            if (tbc.selectedIndex >= (NSInteger)m.count) tbc.selectedIndex = 0;
+            JTDiag(@"[实验] ★ 本次只移除 index=%d（%lu → %lu 个 tab）。"
+                    "请看屏幕上哪个 tab 消失了。", idx,
+                   (unsigned long)gJTSavedVCs.count, (unsigned long)m.count);
+        } else {
+            JTDiag(@"[实验] ★ 本次不做移除，只把 tab 恢复成原始的 %lu 个。",
+                   (unsigned long)gJTSavedVCs.count);
+        }
+
+        // 2) 立刻 + 0.8 秒后各 dump 一次。
+        //    自绘图标如果是"等下一轮 layout 才重建"，只有延后那次能看出来 ——
+        //    这正是未知 2 的判据。
+        JTDiag(@"[实验] 移除后（立即）\n%@", JTDescribeTabBar(tbc));
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UITabBarController *t2 = JTFindTabBarController();
+            if (t2) JTDiag(@"[实验] 移除后（+0.8s）\n%@", JTDescribeTabBar(t2));
+        });
+    } @catch (NSException *e) {
+        JTDiag(@"[实验] 异常: %@", e.reason);
+    }
+}
+
 // ============================== 12. 悬浮按钮 ==============================
 
 @implementation JTBtnHandler
@@ -1228,6 +1432,20 @@ static void JTLaunchGuardReset(void) {
         NSString *snap = JTDiagSnapshot();
         UIPasteboard.generalPasteboard.string = snap;
         [self flash:[NSString stringWithFormat:@"ALL %lu", (unsigned long)snap.length]];
+    } @catch (NSException *e) {
+        [self flash:@"err"];
+    }
+}
+
+// RM 按钮：逐个移除 tab 的实验入口。
+// 每点一次：先恢复原状 → 只移除一个 index → 记录 → 把诊断写进剪贴板。
+// 连点 6 次（5 个 tab + 1 次纯恢复）就把 5 个 index 全试完。
+- (void)onProbe:(UIButton *)sender {
+    @try {
+        JTProbeRemoveTab();
+        UIPasteboard.generalPasteboard.string = JTDiagSnapshot();
+        int shown = (gJTProbeCursor == 0) ? (int)gJTSavedVCs.count : gJTProbeCursor - 1;
+        [self flash:[NSString stringWithFormat:@"-%d", shown]];
     } @catch (NSException *e) {
         [self flash:@"err"];
     }
@@ -1284,12 +1502,29 @@ static void JTInstallFloatButton(void) {
         [b addGestureRecognizer:pan];
 
         [w.rootViewController.view addSubview:b];
+
+        // 第二个按钮 RM：逐个移除 tab 的实验入口。
+        // 单独一个按钮、单独一种颜色 —— 混进 JT 按钮的手势里会误触，
+        // 而误触会真的改 tab bar（虽然可恢复，但会让人以为 App 出问题了）。
+        UIButton *rm = [UIButton buttonWithType:UIButtonTypeCustom];
+        rm.frame = CGRectMake(0, 0, 44, 44);
+        rm.backgroundColor = [UIColor colorWithRed:0.72 green:0.28 blue:0.10 alpha:0.80];
+        rm.layer.cornerRadius = 22.0;
+        rm.layer.masksToBounds = YES;
+        rm.titleLabel.font = [UIFont boldSystemFontOfSize:12.0];
+        [rm setTitle:@"RM" forState:UIControlStateNormal];
+        [rm setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        rm.center = CGPointMake(w.bounds.size.width - 34.0, 182.0);
+        [rm addTarget:h action:@selector(onProbe:) forControlEvents:UIControlEventTouchUpInside];
+        [w.rootViewController.view addSubview:rm];
+
         w.hidden = NO;
 
         gJTOverlay = w;
         gJTButton = b;
+        gJTRmButton = rm;
         gJTBtnHandler = h;   // 必须持有：target-action 不 retain target
-        JTDiag(@"[悬浮按钮] 已安装");
+        JTDiag(@"[悬浮按钮] 已安装（JT=抓取/长按，RM=逐个移除 tab 实验）");
     } @catch (NSException *e) {
         JTDiag(@"[悬浮按钮] 安装异常: %@", e.reason);
     }
