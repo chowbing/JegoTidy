@@ -1,28 +1,26 @@
 // ============================================================================
 // Tweak.xm — 无忧行 (com.cmi.jegotrip) 界面精简 Tweak
-// v0.2 探针版（只观测，不修改界面）
+// v0.3 —— 第一个**会改界面**的版本（v0.2 是纯探针）
 // ============================================================================
 // 目标（已与 Shawn 确认）：
 //   1) 把「首页 / 目的地 / 流量」这三个 **tab 从导航栏移除**，App 直接落到剩下的 tab；
 //   2) 拦掉开屏广告与启动弹窗；
 //   3) 清掉剩余的广告/营销位。
 //
-// 为什么这一版仍然是"探针"而不是直接写规则：
-//   无忧行是原生 + H5 混合的国产 App，tab bar **很可能不是系统 UITabBarController**
-//   而是自绘容器。这两条路线的改法完全不同，猜错就是白跑一轮构建。
-//   所以本版不做任何修改，只把"tab 是怎么建出来的"这件事拿到**直接证据**：
-//     · 谁调用了 setViewControllers:animated:（含调用栈 = 构造 tab 的那个类）
-//     · VC 数组里每一项的类名 + tab 标题 + tag  ← 这一条直接给出"哪个标题对应哪个类"
-//     · 当前进程里所有 UITabBarController 的实时状态
-//     · 全进程类名扫描（TabBar/容器类、广告/弹窗类）
-//     · 所有 presentViewController: 的调用（含首次出现的调用栈）
-//     · UIWindow addSubview: 里命中的广告/开屏类
+// 三条线各自的实现位置：
+//   ① 移除 tab          → 第 12b 节（JTApplyTabRule / JTFixDrawnTabItems）
+//   ② 拦开屏 / 启动弹窗 → 第 7 节（JTClassLooksLikeSplashOrPopup + JTPresentHook 尾部的收尾）
+//   ③ 清广告位          → 第 12c 节（JTSweepBlockAds + 定时器）
 //
 // 使用方式（真机）：
-//   1) 打开 App，右上角出现蓝色小圆点（可拖动）。
-//   2) 进「首页」点一下 → 进「目的地」点一下 → 进「流量」点一下。
-//   3) **长按**圆点 → 完整诊断（含上面全部取证）写进剪贴板 → 粘贴回给我。
-//   4) 顺便把启动时看到的活动弹窗也复现一次，再长按复制。
+//   1) 打开 App。右上角两个小圆点（都可拖动）：
+//        · 蓝色 JT —— 点 = 抓当前页并复制；长按 = 复制全部诊断
+//        · 橙色 T  —— 点 = 手动再应用一次 tab 规则；长按 = **恢复原始 5 个 tab 并停手**
+//   2) 正常用一遍：切切 tab、进各页面、把启动时看到的弹窗复现一次。
+//   3) **长按 JT** → 完整诊断写进剪贴板 → 粘贴回来。
+//
+// ★ 后悔药：如果 tab 删错了（比如「流量」其实不是我们以为的那个），**长按橙色 T**
+//   即可当场恢复原始 5 个 tab，并在本次启动内不再应用规则。不用重装、不用重启。
 //
 // 安全设计（每一条都对应上一轮踩过的坑）：
 //   · 诊断钩子绝不放在启动路径：%ctor 只装崩溃处理器，其余 dispatch 到主队列。
@@ -34,6 +32,47 @@
 //   · 启动自愈计数：同一构建连续 3 次启动异常 → 本次只留悬浮按钮、不装任何钩子。
 //   · 诊断缓冲用滚动窗口 + 显式截断标记，绝不"写满就静默停止"。
 //   · 信号处理函数里只用 open/write/snprintf/backtrace_*（异步信号安全）。
+//   · v0.3 新增的每处"改界面"都有对应的放弃条件（匹配不上就不动）、幂等保证、
+//     以及一个现场可用的撤销入口（长按 T）。详见文件头下面那段。
+//
+// ---------------------------------------------------------------------------
+// v0.3 相对 v0.2 的变更（依据 = 2026-09-30 v0.2b 真机 dump，不是推断）
+// ---------------------------------------------------------------------------
+// dump 确认的事实：
+//   · tab bar 是**系统 UITabBarController**（Path A），5 个 tab，tag = 1000..1004
+//   · tabBar = `JegoTabBar`（App 子类化的 UITabBar），frame=(0,849,430,83)，屏宽 430
+//   · 自绘图标是 tabBar 的**直接子视图**、类名 `FLAnimatedImageView`，按 x 排在
+//     0 / 86 / 172 / 258 / 344（= i × 430/5）；第 k 个 ↔ 第 k 个 tab。
+//     第 2 个（x=172）是凸起 55×55 大图标、没有 UILabel。
+//   · 5 个 tab 的 VC 类名**全是** `BaseNavigationController`（认不出），
+//     `UITabBarItem.title` **全空**（认不出）→ 只能按 `UITabBarItem.tag` 认。
+//   · 过滤 `viewControllers` 后**真实 `UITabBarButton` 会跟着变**（5→4 并重排），
+//     但**自绘的 5 个 `FLAnimatedImageView` 一个都不动** → 只过滤会留下"幽灵图标"。
+//
+// 所以 tab 移除做成**两层**：
+//   A) 过滤 `viewControllers`（保留 tag 1003/1004）→ 真实按钮正确
+//   B) 按槽位隐藏 + 重排自绘图标 → 视觉正确（只做 A 会看到残留图标）
+//
+// 为什么自绘图标是"隐藏 + 重排"而不是只隐藏：
+//   只 `hidden=YES` 的话，保留的两个图标仍在 x=258/344（靠右），左边空三格，看着就是坏的。
+//   所以按 n 个保留项重算中心 `x = (k+0.5) × W/n` —— 与系统按钮自己的重排公式一致。
+//
+// 为什么用**主动扫描 + 定时复检**而不是只靠 `setViewControllers:` 钩子：
+//   v0.2 dump 证明启动期的 `setViewControllers:` 在我们装钩子**之前**就调完了
+//   （日志里一条 `[TabBar设置]` 都没有）→ 钩子拿不到启动那一次，必须主动扫。
+//   定时复检是为了兜住"App 之后按服务端配置重建 tab bar"（`JGTabBarConfigModel`）。
+//
+// 广告位处理走**定时扫掠视图树**（`JTSweepBlockAds`），不走 `addSubview:` 钩子：
+//   `addSubview:` 是热方法，为全 App 每个 UIView 加一次类名判定不值得；而且它只覆盖
+//   "被加进来"的那一刻，懒加载 / 复用 / 异步换内容都容易漏。扫掠对"什么时候出现"
+//   完全不敏感 —— 广告只要进了视图树，下一秒就被扫到。
+//
+// ★ 安全底线（每一条都对应一种"会把 App 弄坏"的方式）：
+//   · 保留 tag 一个都没匹配上 → **整体放弃**，绝不把 tab 清空
+//   · 保留集等于全集（无可移除）→ 什么都不做
+//   · 自绘图标数量与预期槽位数不一致 → **不猜**，只记日志
+//   · 所有改动**幂等**：状态已经对了就一个字节都不改（否则会和 App 自己的重排打架、闪烁）
+//   · 悬浮按钮 T 长按 = **恢复原始 5 个 tab 并停手**（v0.3 的后悔药）
 // ============================================================================
 
 #import <UIKit/UIKit.h>
@@ -43,6 +82,7 @@
 #import <objc/message.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 #include <execinfo.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -55,7 +95,7 @@
 // ============================== 配置 ==============================
 
 #define JT_TAG              "JegoTidy"
-#define JT_VERSION          "0.2-probe"
+#define JT_VERSION          "0.3"
 #define JT_BUNDLE_ID        "com.cmi.jegotrip"
 
 #define ENABLE_CRASH_LOG         1   // 崩溃取证
@@ -64,6 +104,27 @@
 #define ENABLE_POPUP_FORENSICS   1   // 弹窗 / 开屏广告取证
 #define ENABLE_OVERLAY_FORENSICS 1   // UIWindow addSubview: 里的广告类取证
 #define ENABLE_CLASS_SCAN        1   // 全进程类名扫描（一次性，+3s 跑）
+
+// ---- v0.3 新开的三条线（对应三个目标） ----
+#define ENABLE_TAB_RULE          1   // ① 移除「首页 / 目的地 / 流量」三个 tab
+#define ENABLE_AD_SWEEP          1   // ③ 定时扫掠视图树，隐藏已确认的广告位
+#define ENABLE_POPUP_BLOCK       1   // ② 收掉开屏广告 / 启动弹窗
+
+// 保留哪些 tab —— 按 `UITabBarItem.tag`。
+// 实测 tag 与 index 一一对应：1000=首页 1001=目的地 1002=流量 1003=电话·消息 1004=我的
+// → 保留 1003/1004，移除 1000/1001/1002。
+// 若 App 改了 tag，这里一个都匹配不上 → 引擎**整体放弃**并大声记日志（不会把 tab 清空）。
+static const NSInteger JTKeepTags[] = { 1003, 1004 };
+#define JT_KEEP_TAG_COUNT   (sizeof(JTKeepTags) / sizeof(JTKeepTags[0]))
+
+// 三个 tab 被移除后，启动默认落到哪个 tab（按 tag）。
+// 1003 = 电话·消息（保留下来的最左一个）。想改成「我的」就换成 1004。
+#define JT_DEFAULT_TAB_TAG  1003
+
+// 广告扫掠参数：限深 / 单窗口节点预算。视图树是几百个节点量级，这两个数是两个数量级的余量。
+#define SWEEP_MAX_DEPTH     12
+#define SWEEP_NODE_BUDGET   3000
+#define SWEEP_INTERVAL_SEC  1.0
 
 #define DUMP_MAX_DEPTH      8
 #define DUMP_MAX_NODES      500
@@ -115,10 +176,21 @@ static UIButton *gJTButton = nil;
 static UIButton *gJTRmButton = nil;
 static id        gJTBtnHandler = nil;
 
-// 「逐个移除 tab」实验的状态（见文件末尾第 14 节）
-static NSArray  *gJTSavedVCs = nil;   // 原始 viewControllers
-static NSInteger gJTSavedSel = 0;     // 原始 selectedIndex
-static int       gJTProbeCursor = 0;  // 0..count-1 逐个试，== count 时只恢复
+// ---- v0.3 ①：tab 规则引擎的状态（见第 12b 节） ----
+// 留底的**原始**全量 viewControllers。必须是"第一次见到的完整那套"，
+// 不能每次复检都覆盖 —— 复检是在我们已经改过之后跑的，那时只剩 2 个，
+// 把 2 个当原始，长按恢复就永远回不来。
+static NSArray  *gJTOrigVCs = nil;
+static NSInteger gJTOrigSel = 0;
+static BOOL      gJTRuleDisabled = NO;   // 长按 T = 本次启动内停手（后悔药）
+static BOOL      gJTRuleApplied  = NO;   // 是否已经应用过一次（决定要不要迁移 selectedIndex）
+static NSString *gJTDrawnWarnKey = nil;  // 自绘图标数不符时的日志去重键
+
+// ---- v0.3 ③：广告扫掠的状态（见第 12c 节） ----
+static NSMutableSet<NSString *> *gJTAdLoggedSuspect = nil;  // 只记日志、不动的可疑类
+static NSMutableSet<NSString *> *gJTAdLoggedHidden  = nil;  // 已隐藏过、已记过日志的类
+static NSMutableDictionary<NSString *, NSNumber *> *gJTSuspectCache = nil;  // 类名 → 可疑判定缓存
+static dispatch_source_t         gJTSweepTimer = NULL;
 
 static NSString *gJTLastTabDesc = nil;
 
@@ -161,7 +233,6 @@ static NSString *JTVCChainOf(id vc, NSUInteger maxDepth);
 static void JTDescribeTabBarSubviews(UITabBar *tb, NSMutableString *s);
 static NSString *JTDescribeTabBar(UITabBarController *tbc);
 static UITabBarController *JTFindTabBarController(void);
-static void JTProbeRemoveTab(void);
 static NSString *JTDescribeAllTabBars(void);
 static NSString *JTDescribeVCArray(NSArray *arr);
 static void JTSetVCsHook(id self, SEL _cmd, NSArray *vcs);
@@ -196,6 +267,28 @@ static void JTInstallFloatButton(void);
 static void JTInstallAfterLaunch(void);
 static void JTLogTabBarState(NSString *reason);
 
+// v0.3 ① tab 规则引擎（第 12b 节）
+static NSArray<NSNumber *> *JTKeepTagList(void);
+static NSArray<NSNumber *> *JTRemovedSlotsOf(NSArray *all);
+static NSString *JTTagListOf(NSArray *vcs);
+static NSInteger JTTagIndexOf(NSArray *vcs, NSInteger tag);
+static NSArray<UIView *> *JTDrawnTabItems(UITabBar *tb);
+static void JTFixDrawnTabItems(UITabBar *tb, NSInteger totalSlots,
+                               NSArray<NSNumber *> *removedIdx, NSString *reason);
+static void JTApplyTabRule(NSString *reason);
+static void JTRestoreTabs(void);
+static void JTScheduleTabRuleReapply(void);
+
+// v0.3 ③ 广告扫掠（第 12c 节）
+static BOOL JTClassIsKnownAdView(NSString *cn);
+static NSUInteger JTSweepBlockAdsInView(UIView *v, NSUInteger depth, NSUInteger *budget,
+                                        NSMutableArray *hiddenNew, NSMutableArray *suspect);
+static void JTSweepBlockAds(NSString *reason);
+static void JTStartAdSweepTimer(void);
+
+// v0.3 ② 开屏 / 弹窗判定（第 7 节用到）
+static BOOL JTClassLooksLikeSplashOrPopup(NSString *cn);
+
 // ============================== 0. 悬浮按钮的窗口 ==============================
 
 // 只让按钮本身接收触摸，其余区域穿透到 App（否则会挡住整个屏幕）。
@@ -218,7 +311,8 @@ static void JTLogTabBarState(NSString *reason);
 - (void)onTap:(UIButton *)sender;
 - (void)onLong:(UILongPressGestureRecognizer *)g;
 - (void)onPan:(UIPanGestureRecognizer *)g;
-- (void)onProbe:(UIButton *)sender;
+- (void)onTabs:(UIButton *)sender;                        // 手动再应用一次 tab 规则
+- (void)onTabsRestore:(UILongPressGestureRecognizer *)g;  // 长按 = 恢复原始 5 个 tab 并停手
 @end
 
 // ============================== 1. 阶段标记 ==============================
@@ -995,9 +1089,48 @@ static BOOL JTShouldCapturePresentStack(NSString *key) {
     }
 }
 
+// ---- v0.3 ②：开屏广告 / 启动弹窗的类名判定 ----
+//
+// 为什么用**很窄**的词表，而不是通用广告关键词：
+//   通用关键词（Ad / Banner / Popup / Activity / Market …）在真实 App 里会命中大量正常业务类，
+//   而"误拦"的后果（登录弹窗、权限弹窗、协议弹窗被吃掉 → 功能直接不可用）比"漏拦"严重得多。
+//   所以这里只收**几乎不可能是正常业务**的开屏/广告词，并额外加一道业务白名单兜底。
+//
+// 为什么只拦 presentViewController: 这一路：
+//   开屏广告的另一种形态（自绘 view 直接贴在 window 上）不走 present，
+//   由第 12c 节的视图树扫掠负责。两路各管一半，不重叠也不留缝。
+//
+// ★ 本函数只做**判定**，不做动作；判定命中的处理在 JTPresentHook 里（见那里的注释）。
+static BOOL JTClassLooksLikeSplashOrPopup(NSString *cn) {
+    if (cn.length == 0) return NO;
+
+    // 业务白名单：命中任何一个词就**绝不拦**。
+    static NSString * const kNever[] = {
+        @"Login", @"Auth", @"Permission", @"Privacy", @"Agreement", @"Protocol",
+        @"Alert", @"Toast", @"HUD", @"Keyboard", @"Picker", @"Share", @"Pay",
+        @"WebView", @"Browser", @"Photo", @"Camera", @"Scan", @"Call", @"Phone",
+    };
+    for (unsigned i = 0; i < sizeof(kNever) / sizeof(kNever[0]); i++) {
+        if ([cn rangeOfString:kNever[i]].location != NSNotFound) return NO;
+    }
+
+    // 明确的开屏 / 广告词。大小写敏感 —— 少命中几个，别多命中一个。
+    static NSString * const kYes[] = {
+        @"Splash", @"LaunchAd", @"LaunchAD", @"LaunchAdv", @"Advertisement",
+        @"AdvertViewController", @"AdvertVC", @"AdViewController", @"AdPopup",
+        @"AdDialog", @"Advertise", @"StartupAd", @"GuideAd",
+    };
+    for (unsigned i = 0; i < sizeof(kYes) / sizeof(kYes[0]); i++) {
+        if ([cn rangeOfString:kYes[i]].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
 static void JTPresentHook(id self, SEL _cmd, id vcToPresent, BOOL animated,
                           __unsafe_unretained id completion) {
     IMP orig = gJTOrigPresent;
+    NSString *pcn = vcToPresent ? NSStringFromClass([vcToPresent class]) : nil;
+    BOOL shouldDismiss = NO;
     @try {
         NSString *key = [NSString stringWithFormat:@"%@ → %@",
                          NSStringFromClass([self class]),
@@ -1005,6 +1138,9 @@ static void JTPresentHook(id self, SEL _cmd, id vcToPresent, BOOL animated,
         NSArray<NSString *> *stack = nil;
         if (JTShouldCapturePresentStack(key)) stack = [NSThread callStackSymbols];
         JTNotePresent(key, stack);
+#if ENABLE_POPUP_BLOCK
+        if (pcn && JTClassLooksLikeSplashOrPopup(pcn)) shouldDismiss = YES;
+#endif
     } @catch (NSException *e) {
     }
     if (orig) {
@@ -1012,6 +1148,25 @@ static void JTPresentHook(id self, SEL _cmd, id vcToPresent, BOOL animated,
         ((void (*)(id, SEL, id, BOOL, __unsafe_unretained id))orig)(self, _cmd, vcToPresent,
                                                                     animated, completion);
     }
+#if ENABLE_POPUP_BLOCK
+    if (shouldDismiss) {
+        // ★ 先**真的让它弹出来**，再在下一轮 runloop 收掉 —— 而不是"不转发"。
+        //   不转发的风险更大：调用方往往在 completion 里推进状态机（"弹窗已展示 → 发下一步请求"），
+        //   我们把这次调用吃掉，App 的状态机就可能永久卡住。
+        //   代价是可能闪一帧，换来的是 App 状态一定自洽 —— 这个交换在"不可调试的真机"上明显更划算。
+        JTDiag(@"[弹窗拦截] 收掉 %@（由 %@ 弹出）", pcn, NSStringFromClass([self class]));
+        // 等它把转场动画走完再收 —— 动画途中 dismiss 会触发 UIKit 的
+        // "dismiss while a presentation is in progress" 警告，行为也不可预期。
+        double delay = animated ? 0.40 : 0.05;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                [(UIViewController *)vcToPresent dismissViewControllerAnimated:NO completion:nil];
+            } @catch (NSException *e) {
+            }
+        });
+    }
+#endif
 }
 
 static void JTInstallPresentHooks(void) {
@@ -1240,6 +1395,23 @@ static void JTNoteVC(UIViewController *vc) {
             [gJTSeenVCs addObject:cls];
         }
     }
+
+    // v0.3：页面出现 = "可能出现新广告位"+"可能重建了 tab bar"这两个时刻的交点。
+    // 两个函数都是幂等的，重复调用不会改任何东西，所以这里放心调。
+    // 节流 0.5s：转场动画里一次可能连续触发多个 viewDidAppear，
+    // 而这两个函数都要走视图树 —— 没必要为同一瞬间跑好几遍。
+    static CFAbsoluteTime sJTNVLast = 0;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - sJTNVLast < 0.5) return;
+    sJTNVLast = now;
+    // ★ 再 dispatch 一跳，**不在 viewDidAppear 的调用栈里**改 tab bar。
+    //   viewDidAppear 处在转场过程中，此刻调 setViewControllers: 属于在 UIKit 的转场中途
+    //   改容器结构 —— 现在（只差数量时）大概率没事，但没必要赌。挪到下一轮 runloop，
+    //   转场已经结束，行为可预期。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        JTApplyTabRule(@"页面出现");
+        JTSweepBlockAds(@"页面出现");
+    });
 }
 
 static void JTViewDidAppearHook(id self, SEL _cmd, BOOL animated) {
@@ -1317,79 +1489,475 @@ static void JTLaunchGuardReset(void) {
     }
 }
 
-// ============================== 12b. 「逐个移除 tab」实验 ==============================
+// ============================== 12b. tab 规则引擎（v0.3 目标 ①） ==============================
 //
-// 为什么做成"点一下试一个"，而不是直接写死 v0.3 的移除规则：
-//
-// 未知 1 —— **「流量」对应哪个 index 还没确认。**
-//   第一轮 dump 里 5 个 tab 的 VC 类名**全是** BaseNavigationController，
-//   UITabBarItem.title 全是空，可见文字只有 4 个（首页/目的地/电话·消息/我的），
-//   剩下 index 2 是凸起大图标、没有文字。只能靠"移除它、看屏幕上哪个消失"来确定。
-//
-// 未知 2 —— **过滤 viewControllers 之后，App 自绘的图标会不会跟着走。**
-//   JegoTabBar 是 App 自己子类化的 UITabBar，那 5 个 FLAnimatedImageView 是它自绘的，
-//   真正的 UITabBarButton 在下面一层。如果自绘图标不跟着 items 重建，
-//   光过滤 viewControllers 会留下"幽灵图标"，v0.3 就得换一条路（直接操作自绘子视图）。
-//   这一条直接决定实现路径，必须实测。
-//
-// 做成"每次只移除一个 + 每次先完整恢复"的顺序实验，一轮同时回答这两个问题。
-// 关键安全属性：**只在点击时发生** —— 不动启动路径，试错了重新打开 App 就恢复，
-// 所以任何一步都不可能把"App 能正常打开"这个已经拿到的成果弄丢。
-static void JTProbeRemoveTab(void) {
-    @try {
-        UITabBarController *tbc = JTFindTabBarController();
-        if (!tbc) {
-            JTDiag(@"[实验] 找不到 UITabBarController");
-            return;
+// 依据见文件头「v0.3 相对 v0.2 的变更」。四条实测事实决定了这里的每个设计：
+//   1. 只能按 `UITabBarItem.tag` 认 tab（类名全是 BaseNavigationController，title 全空）
+//   2. 移除必须**两层**：过滤 viewControllers（真实按钮）+ 按槽位处理自绘图标（视觉）
+//   3. 启动期 `setViewControllers:` 发生在装钩子之前 → 必须**主动扫**，不能等钩子
+//   4. 一切**幂等**：本族函数会被定时复检 / viewDidAppear / 手动按钮反复调用，
+//      状态已经对了就一个字节都不改 —— 否则会和 App 自己的重排互相打架，屏幕会闪
+
+static NSArray<NSNumber *> *JTKeepTagList(void) {
+    NSMutableArray *a = [NSMutableArray arrayWithCapacity:JT_KEEP_TAG_COUNT];
+    for (NSUInteger i = 0; i < JT_KEEP_TAG_COUNT; i++) [a addObject:@(JTKeepTags[i])];
+    return a;
+}
+
+// 返回 all 里**要移除的那些下标**（下标基于 all 的顺序）
+static NSArray<NSNumber *> *JTRemovedSlotsOf(NSArray *all) {
+    NSMutableArray *rm = [NSMutableArray array];
+    if (![all isKindOfClass:[NSArray class]]) return rm;
+    NSArray<NSNumber *> *keep = JTKeepTagList();
+    NSUInteger i = 0;
+    for (id o in all) {
+        NSInteger tag = 0;
+        if ([o isKindOfClass:[UIViewController class]]) {
+            @try {
+                tag = ((UIViewController *)o).tabBarItem.tag;
+            } @catch (NSException *e) {
+                tag = 0;
+            }
         }
+        if (![keep containsObject:@(tag)]) [rm addObject:@(i)];
+        i++;
+    }
+    return rm;
+}
 
-        // 第一次点击时记录原始状态；之后每次实验都从这里恢复，保证每次都从干净状态开始
-        if (!gJTSavedVCs) {
-            gJTSavedVCs = [tbc.viewControllers copy];
-            gJTSavedSel = tbc.selectedIndex;
-            JTDiag(@"[实验] 已记录原始状态：%lu 个 tab，selectedIndex=%ld",
-                   (unsigned long)gJTSavedVCs.count, (long)gJTSavedSel);
+static NSString *JTTagListOf(NSArray *vcs) {
+    NSMutableArray *a = [NSMutableArray array];
+    if ([vcs isKindOfClass:[NSArray class]]) {
+        for (id o in vcs) {
+            if ([o isKindOfClass:[UIViewController class]]) {
+                NSInteger tag = 0;
+                @try {
+                    tag = ((UIViewController *)o).tabBarItem.tag;
+                } @catch (NSException *e) {
+                    tag = 0;
+                }
+                [a addObject:[NSString stringWithFormat:@"%ld:%@", (long)tag,
+                              NSStringFromClass([o class])]];
+            } else {
+                [a addObject:@"<非VC>"];
+            }
         }
-        if (gJTSavedVCs.count == 0) {
-            JTDiag(@"[实验] 原始 viewControllers 为空，无法实验");
-            return;
+    }
+    return [a componentsJoinedByString:@" "];
+}
+
+static NSInteger JTTagIndexOf(NSArray *vcs, NSInteger tag) {
+    if (![vcs isKindOfClass:[NSArray class]]) return -1;
+    NSUInteger i = 0;
+    for (id o in vcs) {
+        NSInteger t = -1;
+        if ([o isKindOfClass:[UIViewController class]]) {
+            @try {
+                t = ((UIViewController *)o).tabBarItem.tag;
+            } @catch (NSException *e) {
+                t = -1;
+            }
         }
+        if (t == tag) return (NSInteger)i;
+        i++;
+    }
+    return -1;
+}
 
-        // 1) 先完整恢复
-        [tbc setViewControllers:gJTSavedVCs animated:NO];
-        if (gJTSavedSel < (NSInteger)gJTSavedVCs.count) tbc.selectedIndex = gJTSavedSel;
-        JTDiag(@"\n===== [实验] 恢复后 =====\n%@", JTDescribeTabBar(tbc));
+// tabBar 的**直接子视图**里，按 x 从小到大排好的自绘图标。
+// 只取直接子视图：实测这 5 个是直接挂在 JegoTabBar 上的；
+// 每个图标**内部**还有一个 FLAnimatedImageView（子图标），递归取会把它们也算进来
+// （实测 5 个直接子视图 + 5 个子图标 = 10 个）。
+static NSArray<UIView *> *JTDrawnTabItems(UITabBar *tb) {
+    NSMutableArray<UIView *> *a = [NSMutableArray array];
+    if (!tb) return a;
+    for (UIView *sv in tb.subviews) {
+        NSString *cn = NSStringFromClass([sv class]);
+        if ([cn rangeOfString:@"FLAnimatedImageView"].location != NSNotFound) [a addObject:sv];
+    }
+    // ★ block 的形参必须写 `id` 而不是 `UIView *`：
+    //   `NSComparator` 的签名是 `NSComparisonResult (^)(id, id)`，而 block 指针类型在 C++ 里
+    //   是**不变**的 —— 形参写 UIView* 在 ObjC 下只是 warning，在 ObjC++ 下可能直接是硬 error。
+    //   这正是本项目最贵的一类错（一次误判 = 一轮 CI + 一次真机安装），所以宁可多写两行强转。
+    [a sortUsingComparator:^NSComparisonResult(id x, id y) {
+        CGFloat ax = ((UIView *)x).frame.origin.x;
+        CGFloat ay = ((UIView *)y).frame.origin.x;
+        if (ax < ay) return NSOrderedAscending;
+        if (ax > ay) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+    return a;
+}
 
-        int idx = gJTProbeCursor;
-        gJTProbeCursor++;
-        if (gJTProbeCursor > (int)gJTSavedVCs.count) gJTProbeCursor = 0;
+// 隐藏被移除槽位的自绘图标，并把保留的那些重排到整条宽度上。
+// removedIdx 为空数组 = 全部恢复显示并重排回原始槽位（长按 T 的恢复路径）。
+//
+// 为什么要重排而不是只隐藏：只 hidden=YES 的话，保留的两个图标仍在 x=258/344（靠右），
+// 左边空三格 —— 一眼就是坏的。重排公式 (k+0.5)×W/n 与系统按钮自己的重排一致。
+static void JTFixDrawnTabItems(UITabBar *tb, NSInteger totalSlots,
+                               NSArray<NSNumber *> *removedIdx, NSString *reason) {
+    if (!tb || totalSlots <= 0) return;
+    NSArray<UIView *> *items = JTDrawnTabItems(tb);
 
-        if (idx < (int)gJTSavedVCs.count) {
-            NSMutableArray *m = [gJTSavedVCs mutableCopy];
-            [m removeObjectAtIndex:(NSUInteger)idx];
-            [tbc setViewControllers:m animated:NO];
-            if (tbc.selectedIndex >= (NSInteger)m.count) tbc.selectedIndex = 0;
-            JTDiag(@"[实验] ★ 本次只移除 index=%d（%lu → %lu 个 tab）。"
-                    "请看屏幕上哪个 tab 消失了。", idx,
-                   (unsigned long)gJTSavedVCs.count, (unsigned long)m.count);
+    // ★ 数量对不上 → **不猜**，只记一次日志。
+    //   槽位是"第 k 个 ↔ 第 k 个 tab"这种**位置约定**，数量一变这个约定就不成立，
+    //   硬套只会把图标藏错地方 —— 藏错比不藏难查得多（一个看不出因果的视觉错乱）。
+    if ((NSInteger)items.count != totalSlots) {
+        NSString *key = [NSString stringWithFormat:@"%lu/%ld",
+                         (unsigned long)items.count, (long)totalSlots];
+        if (![gJTDrawnWarnKey isEqualToString:key]) {
+            gJTDrawnWarnKey = key;
+            NSMutableString *sub = [NSMutableString string];
+            JTDescribeTabBarSubviews(tb, sub);
+            JTDiag(@"[tab自绘·%@] 自绘图标 %lu 个 ≠ 预期槽位 %ld 个 → 本项**不做任何改动**，"
+                    "只记录。当前 tab bar 直接子视图：\n%@",
+                   reason, (unsigned long)items.count, (long)totalSlots, sub);
+        }
+        return;
+    }
+
+    NSMutableArray<UIView *> *kept = [NSMutableArray array];
+    NSUInteger nHide = 0, nShow = 0;
+    for (NSUInteger i = 0; i < items.count; i++) {
+        UIView *v = items[i];
+        if ([removedIdx containsObject:@(i)]) {
+            if (!v.hidden) {
+                v.hidden = YES;
+                nHide++;
+            }
         } else {
-            JTDiag(@"[实验] ★ 本次不做移除，只把 tab 恢复成原始的 %lu 个。",
-                   (unsigned long)gJTSavedVCs.count);
+            if (v.hidden) {
+                v.hidden = NO;
+                nShow++;
+            }
+            [kept addObject:v];
         }
+    }
 
-        // 2) 立刻 + 0.8 秒后各 dump 一次。
-        //    自绘图标如果是"等下一轮 layout 才重建"，只有延后那次能看出来 ——
-        //    这正是未知 2 的判据。
-        JTDiag(@"[实验] 移除后（立即）\n%@", JTDescribeTabBar(tbc));
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            UITabBarController *t2 = JTFindTabBarController();
-            if (t2) JTDiag(@"[实验] 移除后（+0.8s）\n%@", JTDescribeTabBar(t2));
-        });
-    } @catch (NSException *e) {
-        JTDiag(@"[实验] 异常: %@", e.reason);
+    CGFloat W = tb.bounds.size.width;
+    if (W <= 1.0) W = tb.frame.size.width;
+    NSUInteger n = kept.count;
+    NSUInteger nMoved = 0;
+    if (n > 0 && W > 1.0) {
+        CGFloat slot = W / (CGFloat)n;
+        for (NSUInteger k = 0; k < n; k++) {
+            UIView *v = kept[k];
+            CGPoint c = v.center;
+            CGFloat want = slot * ((CGFloat)k + 0.5);
+            if (fabs((double)(c.x - want)) > 0.5) {
+                c.x = want;
+                v.center = c;
+                nMoved++;
+            }
+        }
+    }
+
+    if (nHide || nShow || nMoved) {
+        JTDiag(@"[tab自绘·%@] 隐藏 %lu / 恢复显示 %lu / 重排 %lu（保留 %lu 项，槽宽 %.1f）",
+               reason, (unsigned long)nHide, (unsigned long)nShow, (unsigned long)nMoved,
+               (unsigned long)n, (n > 0 && W > 1.0) ? (double)(W / (CGFloat)n) : 0.0);
     }
 }
+
+// 应用规则。**可重复调用**：状态已经对了就一个字节都不改。
+// 调用点：启动、定时复检链、每次页面出现（节流）、悬浮按钮 T。
+static void JTApplyTabRule(NSString *reason) {
+#if ENABLE_TAB_RULE
+    if (gJTRuleDisabled) return;
+    @try {
+        UITabBarController *tbc = JTFindTabBarController();
+        if (!tbc) return;   // tab bar 还没建出来 —— 这是常态，不是错误，下次复检再来
+
+        NSArray *cur = tbc.viewControllers;
+        if (![cur isKindOfClass:[NSArray class]] || cur.count == 0) return;
+
+        // ---- 第一次见到"完整的那套"时留底 ----
+        // 只有"保留集是 cur 的真子集"才认为这是原始全量。不能无条件留底：
+        // 复检是在我们已经改过之后跑的，那时 cur 只剩 2 个 —— 把 2 个当原始，
+        // 长按恢复就永远回不来（那正是后悔药失效的最隐蔽方式）。
+        if (!gJTOrigVCs) {
+            NSArray<NSNumber *> *rm = JTRemovedSlotsOf(cur);
+            if (rm.count == 0) {
+                // ★ 安全底线一：一个都匹配不上（App 可能改了 tag）→ 整体放弃。
+                //   绝不"猜一个删掉"，也绝不把 tab 清空。
+                JTDiag(@"[tab规则] ★ 保留 tag {%@} 在现有 %lu 个 tab 里一个都没匹配上 → "
+                        "本次**不做任何修改**（避免把 tab 清空）。现有：%@",
+                       [JTKeepTagList() componentsJoinedByString:@","],
+                       (unsigned long)cur.count, JTTagListOf(cur));
+                return;
+            }
+            gJTOrigVCs = [cur copy];
+            gJTOrigSel = tbc.selectedIndex;
+            JTDiag(@"[tab规则] 已留底：%lu 个 tab，selectedIndex=%ld，将移除下标 {%@}。现有：%@",
+                   (unsigned long)gJTOrigVCs.count, (long)gJTOrigSel,
+                   [rm componentsJoinedByString:@","], JTTagListOf(gJTOrigVCs));
+        }
+
+        // ---- 按**留底的原始顺序**算保留集 ----
+        // 不按 cur 现算：cur 可能已经被我们改过，那样每轮算出来的结果都可能不同。
+        NSArray<NSNumber *> *keep = JTKeepTagList();
+        NSMutableArray<UIViewController *> *kept = [NSMutableArray array];
+        for (id o in gJTOrigVCs) {
+            if (![o isKindOfClass:[UIViewController class]]) continue;
+            UIViewController *vc = (UIViewController *)o;
+            NSInteger tag = 0;
+            @try {
+                tag = vc.tabBarItem.tag;
+            } @catch (NSException *e) {
+                tag = 0;
+            }
+            if ([keep containsObject:@(tag)]) [kept addObject:vc];
+        }
+        // ★ 安全底线二：一个都不剩，或本来就没得可移 → 什么都不做（绝不清空 tab）
+        if (kept.count == 0 || kept.count >= gJTOrigVCs.count) return;
+
+        if (cur.count != kept.count) {
+            [tbc setViewControllers:kept animated:NO];
+            JTDiag(@"[tab规则·%@] viewControllers %lu → %lu",
+                   reason, (unsigned long)cur.count, (unsigned long)kept.count);
+        }
+
+        // ---- selectedIndex ----
+        // 首次应用：把"停在被移除的那个 tab"迁到默认 tab。
+        // 之后**只在越界时才碰** —— 否则每次复检都会把用户刚切到的 tab 拽回默认值
+        // （这是"每次切 tab 都被弹回去"这类诡异 bug 的典型成因）。
+        NSInteger want = JTTagIndexOf(kept, JT_DEFAULT_TAB_TAG);
+        if (want < 0) want = 0;
+        NSInteger sel = tbc.selectedIndex;
+        BOOL outOfRange = (sel < 0 || sel >= (NSInteger)kept.count);
+        if (!gJTRuleApplied) {
+            BOOL origRemoved = NO;
+            if (gJTOrigSel >= 0 && gJTOrigSel < (NSInteger)gJTOrigVCs.count) {
+                UIViewController *orig = (UIViewController *)gJTOrigVCs[(NSUInteger)gJTOrigSel];
+                origRemoved = ![kept containsObject:orig];
+            }
+            if (outOfRange || origRemoved) {
+                if (tbc.selectedIndex != want) tbc.selectedIndex = want;
+                JTDiag(@"[tab规则·%@] selectedIndex %ld → %ld（原选中项已被移除或越界）",
+                       reason, (long)sel, (long)want);
+            }
+        } else if (outOfRange) {
+            tbc.selectedIndex = want;
+            JTDiag(@"[tab规则·%@] selectedIndex 越界（%ld）→ %ld", reason, (long)sel, (long)want);
+        }
+
+        // ---- 自绘图标（视觉层）----
+        JTFixDrawnTabItems(tbc.tabBar, (NSInteger)gJTOrigVCs.count,
+                           JTRemovedSlotsOf(gJTOrigVCs), reason);
+
+        gJTRuleApplied = YES;
+    } @catch (NSException *e) {
+        JTDiag(@"[tab规则·%@] 异常: %@", reason, e.reason);
+    }
+#endif
+}
+
+// 长按 T = 后悔药：恢复原始 5 个 tab，并在**本次启动内**彻底停手。
+// 为什么必须同时停手：复检链还在跑，不停手的话下一次复检会立刻把 tab 又删掉，
+// 用户看到的就是"按了没反应"—— 比没有后悔药更糟。
+static void JTRestoreTabs(void) {
+    @try {
+        gJTRuleDisabled = YES;
+        UITabBarController *tbc = JTFindTabBarController();
+        if (!tbc || !gJTOrigVCs) {
+            JTDiag(@"[tab规则] 恢复：没有留底（规则可能从未生效），无事可做");
+            return;
+        }
+        [tbc setViewControllers:gJTOrigVCs animated:NO];
+        if (gJTOrigSel >= 0 && gJTOrigSel < (NSInteger)gJTOrigVCs.count) {
+            tbc.selectedIndex = gJTOrigSel;
+        }
+        // 空 removedIdx = 全部恢复显示 + 重排回原始槽位
+        JTFixDrawnTabItems(tbc.tabBar, (NSInteger)gJTOrigVCs.count, @[], @"手动恢复");
+        gJTRuleApplied = NO;
+        JTDiag(@"[tab规则] ★ 已恢复原始 %lu 个 tab，本次启动内不再应用规则"
+                "（重开 App 即恢复自动应用）", (unsigned long)gJTOrigVCs.count);
+    } @catch (NSException *e) {
+        JTDiag(@"[tab规则] 恢复异常: %@", e.reason);
+    }
+}
+
+static void JTScheduleTabRuleReapply(void) {
+#if ENABLE_TAB_RULE
+    // 启动期 tab bar 是**分批**建起来的（先 5 个，之后还可能按服务端配置重建），
+    // 所以复检不是"等一次"，而是一条逐渐拉长的链。
+    // 每次都幂等：改不动就什么都不做，所以这 10 次调用在正常情况下只有前 1~2 次有实际动作。
+    static const double kOffsets[] = { 0.3, 0.8, 1.5, 2.5, 4.0, 6.0, 9.0, 13.0, 20.0, 30.0 };
+    for (unsigned i = 0; i < sizeof(kOffsets) / sizeof(kOffsets[0]); i++) {
+        double d = kOffsets[i];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            JTApplyTabRule([NSString stringWithFormat:@"+%.1fs", d]);
+        });
+    }
+#endif
+}
+
+// ============================== 12c. 广告位扫掠（v0.3 目标 ③） ==============================
+//
+// 机制选择：**定时扫掠窗口视图树**，而不是 hook `addSubview:`。两个理由：
+//   · `addSubview:` 是热方法。为全 App 每个 UIView 加一次类名判定不值得，而且它只覆盖
+//     "被加进来"的那一刻 —— 懒加载 / cell 复用 / 异步换内容都容易漏。
+//   · 扫掠对"什么时候出现"完全不敏感：广告只要进了视图树，下一次扫掠就命中。
+//     成本 = 每秒走一遍窗口树（限深 12、单窗口限 3000 节点），对几百个节点的树可以忽略。
+//
+// ★ 只清**实测确认过**的广告类，不做关键词泛匹配：
+//   v0.2 dump 在首页视图树里实测到 `TripOperatingAdCell`(430×259) 与
+//   `JegoSuspendedADView`(73×73 右下角悬浮)。
+//   关键词泛匹配（Ad / Banner / Market …）会把正常业务视图一起误伤，而"误伤"比"漏清"
+//   难查得多 —— 漏清只是少个广告，误伤是功能没了。
+//   所以泛匹配**只用来记日志**（下一轮靠日志把类名补进白名单），不参与隐藏。
+//
+// 已知边界（不假装覆盖）：
+//   · 首页被移除后，首页里那两个广告位本来就到不了了 —— 这一节真正有价值的是
+//     `JegoSuspendedADView` 这类**跨页悬浮**的广告位。
+//   · 扫掠只看原生视图树，管不到 H5/WKWebView 里的广告（那要走注入 CSS，另一条线）。
+
+// 扫掠用的"可疑"判定 —— 比第 8 节的 JTClassNameInteresting **更窄**。
+// 那个函数是给 addSubview: 用的（只对少数几个被加进 window 的视图做判定，可以宽松）；
+// 扫掠会碰到整棵视图树的每一个类，用同一份词表会灌进大量无关类名（Launch/Alert/Float…），
+// 把真正要看的广告类淹掉。词表窄一点，日志才读得动。
+static BOOL JTClassLooksLikeAdSuspect(NSString *cn) {
+    if (cn.length == 0) return NO;
+    NSNumber *cached = nil;
+    @synchronized (@"JTSuspect") {
+        if (!gJTSuspectCache) gJTSuspectCache = [NSMutableDictionary dictionary];
+        cached = gJTSuspectCache[cn];
+    }
+    if (cached) return cached.boolValue;
+
+    static NSString * const kSuspect[] = {
+        @"Advert", @"AdBanner", @"AdCell", @"AdView", @"ADView", @"Banner",
+        @"Promo", @"Coupon", @"RedPacket", @"Market", @"Splash", @"Popup",
+    };
+    BOOL hit = NO;
+    for (unsigned i = 0; i < sizeof(kSuspect) / sizeof(kSuspect[0]); i++) {
+        if ([cn rangeOfString:kSuspect[i]].location != NSNotFound) {
+            hit = YES;
+            break;
+        }
+    }
+    @synchronized (@"JTSuspect") {
+        gJTSuspectCache[cn] = @(hit);
+    }
+    return hit;
+}
+
+// 某个类名是不是**实测确认**的广告视图
+static BOOL JTClassIsKnownAdView(NSString *cn) {
+    if (cn.length == 0) return NO;
+    static NSString * const kKnown[] = {
+        @"TripOperatingAdCell",     // 首页运营位广告 cell（实测 430×259）
+        @"JegoSuspendedADView",     // 悬浮广告（实测 73×73，右下角）
+    };
+    for (unsigned i = 0; i < sizeof(kKnown) / sizeof(kKnown[0]); i++) {
+        if ([cn isEqualToString:kKnown[i]]) return YES;
+    }
+    return NO;
+}
+
+static NSUInteger JTSweepBlockAdsInView(UIView *v, NSUInteger depth, NSUInteger *budget,
+                                        NSMutableArray *hiddenNew, NSMutableArray *suspect) {
+    if (!v || depth > (NSUInteger)SWEEP_MAX_DEPTH || !budget || *budget == 0) return 0;
+    (*budget)--;
+    NSUInteger acted = 0;
+    NSString *cn = NSStringFromClass([v class]);
+
+    if (JTClassIsKnownAdView(cn)) {
+        if (!v.hidden) {
+            v.hidden = YES;
+            acted++;
+            // 日志只在"某个类第一次被隐藏"时打一次 —— 否则 App 一旦把广告重新显示出来，
+            // 我们就每秒刷一行，把真正有用的信息挤出诊断缓冲。
+            @synchronized (@"JTAdLog") {
+                if (!gJTAdLoggedHidden) gJTAdLoggedHidden = [NSMutableSet set];
+                if (![gJTAdLoggedHidden containsObject:cn] && gJTAdLoggedHidden.count < 40) {
+                    [gJTAdLoggedHidden addObject:cn];
+                    [hiddenNew addObject:cn];
+                }
+            }
+        }
+    } else if (JTClassLooksLikeAdSuspect(cn)) {
+        // 只是"可疑" —— **不动它**，只记一次类名，供下一轮补白名单
+        @synchronized (@"JTAdLog") {
+            if (!gJTAdLoggedSuspect) gJTAdLoggedSuspect = [NSMutableSet set];
+            if (![gJTAdLoggedSuspect containsObject:cn] && gJTAdLoggedSuspect.count < 80) {
+                [gJTAdLoggedSuspect addObject:cn];
+                [suspect addObject:cn];
+            }
+        }
+    }
+
+    for (UIView *c in v.subviews) {
+        if (*budget == 0) break;
+        acted += JTSweepBlockAdsInView(c, depth + 1, budget, hiddenNew, suspect);
+    }
+    return acted;
+}
+
+static void JTSweepBlockAds(NSString *reason) {
+#if ENABLE_AD_SWEEP
+    @try {
+        UIApplication *app = [UIApplication sharedApplication];
+        // 后台不扫：一是没必要，二是往非活跃界面写 hidden 没意义，还可能干扰 App 自己的状态恢复
+        if (!app || app.applicationState != UIApplicationStateActive) return;
+
+        NSMutableArray *hiddenNew = [NSMutableArray array];
+        NSMutableArray *suspect = [NSMutableArray array];
+        NSUInteger acted = 0;
+        for (UIWindow *w in app.windows) {
+            if ([w isKindOfClass:[JTOverlayWindow class]]) continue;
+            NSUInteger budget = SWEEP_NODE_BUDGET;
+            acted += JTSweepBlockAdsInView(w, 0, &budget, hiddenNew, suspect);
+        }
+        if (hiddenNew.count > 0) {
+            JTDiag(@"[广告清理·%@] 隐藏 %lu 个（本次新命中类：%@）",
+                   reason, (unsigned long)acted, [hiddenNew componentsJoinedByString:@", "]);
+        }
+        if (suspect.count > 0) {
+            JTDiag(@"[广告清理·%@] 可疑但**未处理**的类（下一轮据此补白名单）：%@",
+                   reason, [suspect componentsJoinedByString:@", "]);
+        }
+    } @catch (NSException *e) {
+    }
+#endif
+}
+
+static void JTStartAdSweepTimer(void) {
+#if ENABLE_AD_SWEEP
+    if (gJTSweepTimer) return;
+    // 用 dispatch_source 而不是 NSTimer：NSTimer 受 runloop mode 影响 ——
+    // 滚动 UITableView 时默认 mode 不跑定时器，滑动期间广告会短暂露出来；
+    // dispatch_source 挂在主队列上，不受 runloop mode 影响。
+    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                 dispatch_get_main_queue());
+    if (!t) {
+        JTDiag(@"[广告清理] 定时器创建失败 —— 本次只有启动那一次扫掠");
+        return;
+    }
+    uint64_t interval = (uint64_t)(SWEEP_INTERVAL_SEC * (double)NSEC_PER_SEC);
+    uint64_t leeway = (uint64_t)(0.3 * (double)NSEC_PER_SEC);
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, (int64_t)interval),
+                              interval, leeway);
+    // ★ 这个定时器同时兜两件事，因为两者的"被 App 撤销"方式是同一个：
+    //   ① 广告扫掠（App 可能把广告重新显示出来）
+    //   ② tab 规则里的**自绘图标层**（App 可能在旋转 / 服务端配置刷新时自己重排，
+    //      把我们已经摆好的图标挪回 5 槽位 —— 那时图标还是可见的，只是位置错乱，
+    //      而启动复检链 +30s 就结束了，光靠它兜不住）
+    //   两个函数都幂等：状态对了就什么都不做，所以每秒调一次在正常情况下是零成本。
+    dispatch_source_set_event_handler(t, ^{
+        UIApplication *app = [UIApplication sharedApplication];
+        if (!app || app.applicationState != UIApplicationStateActive) return;
+        JTApplyTabRule(@"定时");
+        JTSweepBlockAds(@"定时");
+    });
+    dispatch_resume(t);
+    gJTSweepTimer = t;
+    JTDiag(@"[维护] 定时复检已启动（每 %.1f 秒一次：tab 规则 + 广告扫掠，仅前台）",
+           SWEEP_INTERVAL_SEC);
+#endif
+}
+
 
 // ============================== 12. 悬浮按钮 ==============================
 
@@ -1437,15 +2005,32 @@ static void JTProbeRemoveTab(void) {
     }
 }
 
-// RM 按钮：逐个移除 tab 的实验入口。
-// 每点一次：先恢复原状 → 只移除一个 index → 记录 → 把诊断写进剪贴板。
-// 连点 6 次（5 个 tab + 1 次纯恢复）就把 5 个 index 全试完。
-- (void)onProbe:(UIButton *)sender {
+// T 按钮（原 RM）：**手动再应用一次 tab 规则**。
+// 为什么需要手动入口：启动期的复检链只覆盖到 +30s。之后如果 App 按服务端配置
+// （`JGTabBarConfigModel`）重建了 tab bar，或者规则第一次因为"tab 还没建出来"没赶上，
+// 点一下就能立刻收干净 —— 不用重装、不用重启。
+- (void)onTabs:(UIButton *)sender {
     @try {
-        JTProbeRemoveTab();
+        gJTRuleDisabled = NO;          // 手动点 = 明确的"我要规则生效"，解除停手
+        JTApplyTabRule(@"手动");
+        JTLogTabBarState(@"手动应用规则");
         UIPasteboard.generalPasteboard.string = JTDiagSnapshot();
-        int shown = (gJTProbeCursor == 0) ? (int)gJTSavedVCs.count : gJTProbeCursor - 1;
-        [self flash:[NSString stringWithFormat:@"-%d", shown]];
+        [self flash:@"T"];
+    } @catch (NSException *e) {
+        [self flash:@"err"];
+    }
+}
+
+// 长按 T = **恢复**原始 5 个 tab，并在本次启动内停手。
+// 这是 v0.3 的"后悔药"：规则一旦误判（比如「流量」其实不是我们以为的那个 index），
+// 不用重装、不用重启，长按一下就回到原样，同时把诊断写进剪贴板供排查。
+- (void)onTabsRestore:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    @try {
+        JTRestoreTabs();
+        JTLogTabBarState(@"手动恢复");
+        UIPasteboard.generalPasteboard.string = JTDiagSnapshot();
+        [self flash:@"复原"];
     } @catch (NSException *e) {
         [self flash:@"err"];
     }
@@ -1503,19 +2088,24 @@ static void JTInstallFloatButton(void) {
 
         [w.rootViewController.view addSubview:b];
 
-        // 第二个按钮 RM：逐个移除 tab 的实验入口。
+        // 第二个按钮 T（原 RM）：tab 规则的手动入口。
         // 单独一个按钮、单独一种颜色 —— 混进 JT 按钮的手势里会误触，
         // 而误触会真的改 tab bar（虽然可恢复，但会让人以为 App 出问题了）。
+        // 点 = 再应用一次规则；长按 = 恢复原始 5 个 tab 并停手。
         UIButton *rm = [UIButton buttonWithType:UIButtonTypeCustom];
         rm.frame = CGRectMake(0, 0, 44, 44);
         rm.backgroundColor = [UIColor colorWithRed:0.72 green:0.28 blue:0.10 alpha:0.80];
         rm.layer.cornerRadius = 22.0;
         rm.layer.masksToBounds = YES;
-        rm.titleLabel.font = [UIFont boldSystemFontOfSize:12.0];
-        [rm setTitle:@"RM" forState:UIControlStateNormal];
+        rm.titleLabel.font = [UIFont boldSystemFontOfSize:13.0];
+        [rm setTitle:@"T" forState:UIControlStateNormal];
         [rm setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         rm.center = CGPointMake(w.bounds.size.width - 34.0, 182.0);
-        [rm addTarget:h action:@selector(onProbe:) forControlEvents:UIControlEventTouchUpInside];
+        [rm addTarget:h action:@selector(onTabs:) forControlEvents:UIControlEventTouchUpInside];
+        UILongPressGestureRecognizer *lp2 =
+            [[UILongPressGestureRecognizer alloc] initWithTarget:h action:@selector(onTabsRestore:)];
+        lp2.minimumPressDuration = 0.6;
+        [rm addGestureRecognizer:lp2];
         [w.rootViewController.view addSubview:rm];
 
         w.hidden = NO;
@@ -1524,7 +2114,7 @@ static void JTInstallFloatButton(void) {
         gJTButton = b;
         gJTRmButton = rm;
         gJTBtnHandler = h;   // 必须持有：target-action 不 retain target
-        JTDiag(@"[悬浮按钮] 已安装（JT=抓取/长按，RM=逐个移除 tab 实验）");
+        JTDiag(@"[悬浮按钮] 已安装（JT=抓取/长按全量；T=手动应用 tab 规则/长按恢复）");
     } @catch (NSException *e) {
         JTDiag(@"[悬浮按钮] 安装异常: %@", e.reason);
     }
@@ -1563,6 +2153,18 @@ static void JTInstallAfterLaunch(void) {
     JTStageSet("安装:悬浮按钮");
     JTInstallFloatButton();
 
+    // ---------------- v0.3 的三条线 ----------------
+    // 顺序有讲究：先应用 tab 规则（它会重建 tab bar 的 VC 数组），再启动广告扫掠
+    // （它会走一遍视图树，这时 tab bar 已经是最终形态，日志里看到的才是有意义的现场）。
+
+    JTStageSet("应用:tab 规则");
+    JTApplyTabRule(@"启动");
+    JTScheduleTabRuleReapply();
+
+    JTStageSet("应用:广告扫掠");
+    JTSweepBlockAds(@"启动");
+    JTStartAdSweepTimer();
+
     // tab bar 在启动后才搭起来，所以要多次复检；内容没变就不重复记录。
     JTLogTabBarState(@"安装后立即");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
@@ -1587,7 +2189,8 @@ static void JTInstallAfterLaunch(void) {
     JTDiag(@"[钩子总览] viewDidAppear=%@ | setViewControllers=%@ | setViewControllers:animated=%@ | present=%@",
            gJTHookedVDA ?: @"无", gJTHookedSetVCs ?: @"无",
            gJTHookedSetVCsAnim ?: @"无", gJTHookedPresent ?: @"无");
-    JTDiag(@"[用法] 点圆点=抓当前页并复制；长按圆点=复制全部诊断");
+    JTDiag(@"[用法] JT: 点=抓当前页并复制 / 长按=复制全部诊断。"
+            "T: 点=手动应用 tab 规则 / 长按=恢复原始 tab 并停手。");
 
     // 活过 20 秒才算"启动成功"，此时才清零计数
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)),
