@@ -1,6 +1,6 @@
 // ============================================================================
 // Tweak.xm — 无忧行 (com.cmi.jegotrip) 界面精简 Tweak
-// v0.3 —— 第一个**会改界面**的版本（v0.2 是纯探针）
+// v0.3.1 —— 修掉 v0.3 首轮真机暴露的「自绘层认错槽位」bug
 // ============================================================================
 // 目标（已与 Shawn 确认）：
 //   1) 把「首页 / 目的地 / 流量」这三个 **tab 从导航栏移除**，App 直接落到剩下的 tab；
@@ -73,6 +73,18 @@
 //   · 自绘图标数量与预期槽位数不一致 → **不猜**，只记日志
 //   · 所有改动**幂等**：状态已经对了就一个字节都不改（否则会和 App 自己的重排打架、闪烁）
 //   · 悬浮按钮 T 长按 = **恢复原始 5 个 tab 并停手**（v0.3 的后悔药）
+//
+// ---------------------------------------------------------------------------
+// v0.3.1：修掉 v0.3 首轮真机暴露的「自绘层认错槽位」
+// ---------------------------------------------------------------------------
+// v0.3 用"把 tabBar 直接子视图按 x 排序，第 k 个 = 第 k 个槽位"来认身份。
+// 这个约定**只在原始 5 槽位布局下成立** —— 我们自己按 2 槽位重排过一次之后，
+// 排序结果就不再等于原始槽位顺序，于是隐藏的是错的那几个，App 每重排一次结果又变一次。
+// **用位置认身份，一旦自己改过位置就自毁。**
+// 修法 = **绑定一次**（只在原始布局下绑定，且要求每个槽位都认到视图），之后一直用绑定。
+// 顺带把"槽位装饰"的收集范围从 `FLAnimatedImageView` 放宽到**所有按槽位摆放的直接子视图**
+// —— tab 2（流量）的凸起装饰是两个普通 `UIView`，原来漏了。
+// 完整证据链与推导见第 12b 节 JTBindDrawnSlots 上面的注释。
 // ============================================================================
 
 #import <UIKit/UIKit.h>
@@ -95,7 +107,7 @@
 // ============================== 配置 ==============================
 
 #define JT_TAG              "JegoTidy"
-#define JT_VERSION          "0.3"
+#define JT_VERSION          "0.3.1"
 #define JT_BUNDLE_ID        "com.cmi.jegotrip"
 
 #define ENABLE_CRASH_LOG         1   // 崩溃取证
@@ -184,7 +196,12 @@ static NSArray  *gJTOrigVCs = nil;
 static NSInteger gJTOrigSel = 0;
 static BOOL      gJTRuleDisabled = NO;   // 长按 T = 本次启动内停手（后悔药）
 static BOOL      gJTRuleApplied  = NO;   // 是否已经应用过一次（决定要不要迁移 selectedIndex）
-static NSString *gJTDrawnWarnKey = nil;  // 自绘图标数不符时的日志去重键
+static NSString *gJTDrawnWarnKey = nil;  // 自绘层绑定失败的日志去重键
+
+// ★ v0.3.1：自绘层的**槽位绑定**（index = 原始槽位，值 = 绑到该槽位的所有直接子视图）。
+//   为什么必须绑一次、不能每次按 x 现算 —— 见第 12b 节 JTBindDrawnSlots 上面的长注释。
+static NSArray<NSMutableArray<UIView *> *> *gJTDrawnSlots = nil;
+static NSString *gJTDrawnStateKey = nil; // 自绘层最终状态的日志去重键
 
 // ---- v0.3 ③：广告扫掠的状态（见第 12c 节） ----
 static NSMutableSet<NSString *> *gJTAdLoggedSuspect = nil;  // 只记日志、不动的可疑类
@@ -272,7 +289,11 @@ static NSArray<NSNumber *> *JTKeepTagList(void);
 static NSArray<NSNumber *> *JTRemovedSlotsOf(NSArray *all);
 static NSString *JTTagListOf(NSArray *vcs);
 static NSInteger JTTagIndexOf(NSArray *vcs, NSInteger tag);
-static NSArray<UIView *> *JTDrawnTabItems(UITabBar *tb);
+static NSArray<UIView *> *JTSlotDecorationCandidates(UITabBar *tb, CGFloat slotW);
+static NSString *JTDescribeSlotViews(NSArray<UIView *> *views);
+static BOOL JTDrawnBindingAlive(UITabBar *tb);
+static BOOL JTBindDrawnSlots(UITabBar *tb, NSInteger totalSlots);
+static NSString *JTDrawnSlotsStateString(void);
 static void JTFixDrawnTabItems(UITabBar *tb, NSInteger totalSlots,
                                NSArray<NSNumber *> *removedIdx, NSString *reason);
 static void JTApplyTabRule(NSString *reason);
@@ -844,10 +865,13 @@ static void JTDescribeTabBarSubviews(UITabBar *tb, NSMutableString *s) {
         NSString *alb = sv.accessibilityLabel;
         NSMutableArray *texts = [NSMutableArray array];
         JTCollectLabels(sv, 0, texts);
-        [s appendFormat:@"      子[%lu] %@ (%.0f,%.0f,%.0f,%.0f)%@%@%@\n",
+        // ★ 显隐必须打出来：v0.3 首轮就是因为没有这一项，日志里只能看到
+        //   "隐藏 1 / 恢复显示 1" 这种无法判断对错的计数，得靠 x 坐标反推。
+        [s appendFormat:@"      子[%lu] %@ (%.0f,%.0f,%.0f,%.0f)%@%@%@%@\n",
             (unsigned long)i, NSStringFromClass([sv class]),
             (double)sv.frame.origin.x, (double)sv.frame.origin.y,
             (double)sv.frame.size.width, (double)sv.frame.size.height,
+            sv.hidden ? @" [隐]" : @" [显]",
             aid.length ? [NSString stringWithFormat:@" id=%@", aid] : @"",
             alb.length ? [NSString stringWithFormat:@" label=%@", alb] : @"",
             texts.count ? [NSString stringWithFormat:@" 文字=[%@]",
@@ -1564,100 +1588,226 @@ static NSInteger JTTagIndexOf(NSArray *vcs, NSInteger tag) {
     return -1;
 }
 
-// tabBar 的**直接子视图**里，按 x 从小到大排好的自绘图标。
-// 只取直接子视图：实测这 5 个是直接挂在 JegoTabBar 上的；
-// 每个图标**内部**还有一个 FLAnimatedImageView（子图标），递归取会把它们也算进来
-// （实测 5 个直接子视图 + 5 个子图标 = 10 个）。
-static NSArray<UIView *> *JTDrawnTabItems(UITabBar *tb) {
+// ---------------------------------------------------------------------------
+// ★★ v0.3.1 修复：自绘层必须**绑定一次**，不能每次按 x 排序现算
+// ---------------------------------------------------------------------------
+// 2026-09-30 v0.3 首轮真机日志里的现象：
+//     [tab自绘·+0.3s]   隐藏 3 / 恢复显示 0 / 重排 2    ← 这一遍是对的
+//     [tab自绘·页面出现] 隐藏 0 / 恢复显示 0 / 重排 2
+//     [tab自绘·+0.8s]   隐藏 1 / 恢复显示 1 / 重排 1    ← 开始把"隐藏/显示"来回翻
+//     [tab自绘·定时]     隐藏 1 / 恢复显示 1 / 重排 1
+//     [tab自绘·+1.5s]   隐藏 1 / 恢复显示 1 / 重排 0
+// 而 +2s 的 tab bar dump 里，三个自绘图标**挤在同一个 x=64**：
+//     子[5] FLAnimatedImageView (64,0,86,51)  文字=[目的地]
+//     子[6] FLAnimatedImageView (64,-8,86,59)
+//     子[7] FLAnimatedImageView (64,0,86,51)  文字=[电话/消息]
+//
+// 根因（是**我自己的设计错**，不是 App 的）：
+//   第一版用"把直接子视图按 x 排序，第 k 个 = 第 k 个槽位"来认槽位。
+//   这个约定**只在原始 5 槽位布局下成立**。一旦我们按 2 槽位重排过
+//   （把保留项摆到 x=64.5 / 279.5），排序结果就不再等于原始槽位顺序 ——
+//   于是 removedIdx {0,1,2} 藏的是**错的那几个**；App 自己每重排一次，
+//   排序结果又变一次 → 隐藏/显示来回翻，最终留下一堆叠在一起的图标。
+//   **用位置去认身份，一旦自己改过位置就自毁。**
+//
+// 修法：**绑定一次，之后一直用绑定**。
+//   · 只在"原始布局"下绑定：每个候选视图的 center.x 必须落在某个槽位中心附近，
+//     且**每个槽位都有**候选（这是明确的放弃条件）
+//   · 绑定结果存成 `槽位 → [视图]`，之后永远不再按 x 重新推断身份
+//   · 每次使用前校验绑定视图是否还挂在 tabBar 上；掉了一个就整体解绑重绑，
+//     重绑失败（布局已不是原始的）→ **放弃并记日志**，不猜
+//
+// 顺带修掉第二个漏网：v0.3 只收 `FLAnimatedImageView`，但 dump 显示 tab 2（流量）的
+// **凸起按钮装饰是两个普通 `UIView`**（子[2] (188,-8,55,4)、子[3] (188,-8,55,55)），
+// 它们是 tabBar 的**直接子视图**，不是那个 `FLAnimatedImageView` 的子视图。
+// 只藏图标的话，导航栏中间会留下一个 55×55 的凸起装饰。
+// → 改成"**所有按槽位摆放的直接子视图**"：排除 `UITabBarButton`（框架自己管，
+//   跟着 `viewControllers` 走）、`_UI*`（私有 chrome，如 `_UIBarBackground`）、
+//   以及比一个槽位宽得多的整条容器。
+
+// 收集 tabBar 的**直接子视图**里所有"按槽位摆放的装饰"。
+// 只在绑定时调用一次，所以这里的过滤可以写得严一点 —— 宁可少收，不要错收。
+static NSArray<UIView *> *JTSlotDecorationCandidates(UITabBar *tb, CGFloat slotW) {
     NSMutableArray<UIView *> *a = [NSMutableArray array];
-    if (!tb) return a;
+    if (!tb || slotW <= 1.0) return a;
     for (UIView *sv in tb.subviews) {
         NSString *cn = NSStringFromClass([sv class]);
-        if ([cn rangeOfString:@"FLAnimatedImageView"].location != NSNotFound) [a addObject:sv];
+        if (cn.length == 0) continue;
+        if ([cn isEqualToString:@"UITabBarButton"]) continue;  // 框架管，跟 viewControllers 走
+        if ([cn hasPrefix:@"_UI"]) continue;                   // 私有 chrome（_UIBarBackground 等）
+        CGSize sz = sv.frame.size;
+        if (sz.width < 1.0 || sz.height < 1.0) continue;       // 零尺寸
+        if (sz.width > slotW * 1.6) continue;                  // 比一个槽位宽得多 → 整条容器
+        [a addObject:sv];
     }
-    // ★ block 的形参必须写 `id` 而不是 `UIView *`：
-    //   `NSComparator` 的签名是 `NSComparisonResult (^)(id, id)`，而 block 指针类型在 C++ 里
-    //   是**不变**的 —— 形参写 UIView* 在 ObjC 下只是 warning，在 ObjC++ 下可能直接是硬 error。
-    //   这正是本项目最贵的一类错（一次误判 = 一轮 CI + 一次真机安装），所以宁可多写两行强转。
-    [a sortUsingComparator:^NSComparisonResult(id x, id y) {
-        CGFloat ax = ((UIView *)x).frame.origin.x;
-        CGFloat ay = ((UIView *)y).frame.origin.x;
-        if (ax < ay) return NSOrderedAscending;
-        if (ax > ay) return NSOrderedDescending;
-        return NSOrderedSame;
-    }];
     return a;
 }
 
-// 隐藏被移除槽位的自绘图标，并把保留的那些重排到整条宽度上。
-// removedIdx 为空数组 = 全部恢复显示并重排回原始槽位（长按 T 的恢复路径）。
-//
-// 为什么要重排而不是只隐藏：只 hidden=YES 的话，保留的两个图标仍在 x=258/344（靠右），
-// 左边空三格 —— 一眼就是坏的。重排公式 (k+0.5)×W/n 与系统按钮自己的重排一致。
-static void JTFixDrawnTabItems(UITabBar *tb, NSInteger totalSlots,
-                               NSArray<NSNumber *> *removedIdx, NSString *reason) {
-    if (!tb || totalSlots <= 0) return;
-    NSArray<UIView *> *items = JTDrawnTabItems(tb);
+// 一行描述一组视图（给日志用）：类名 + 显/隐 + 内含文字 + x
+static NSString *JTDescribeSlotViews(NSArray<UIView *> *views) {
+    NSMutableArray *parts = [NSMutableArray array];
+    for (UIView *v in views) {
+        NSMutableArray *texts = [NSMutableArray array];
+        JTCollectLabels(v, 0, texts);
+        NSString *t = texts.count
+            ? [NSString stringWithFormat:@"(%@)", [texts componentsJoinedByString:@"/"]]
+            : @"";
+        [parts addObject:[NSString stringWithFormat:@"%@%@%@ x=%.0f",
+                          NSStringFromClass([v class]),
+                          v.hidden ? @"·隐" : @"·显",
+                          t, (double)v.frame.origin.x]];
+    }
+    return [parts componentsJoinedByString:@" + "];
+}
 
-    // ★ 数量对不上 → **不猜**，只记一次日志。
-    //   槽位是"第 k 个 ↔ 第 k 个 tab"这种**位置约定**，数量一变这个约定就不成立，
-    //   硬套只会把图标藏错地方 —— 藏错比不藏难查得多（一个看不出因果的视觉错乱）。
-    if ((NSInteger)items.count != totalSlots) {
-        NSString *key = [NSString stringWithFormat:@"%lu/%ld",
-                         (unsigned long)items.count, (long)totalSlots];
+// 绑定是否还有效（所有绑定的视图都还挂在 tb 上）
+static BOOL JTDrawnBindingAlive(UITabBar *tb) {
+    if (!gJTDrawnSlots) return NO;
+    for (NSArray<UIView *> *slot in gJTDrawnSlots) {
+        for (UIView *v in slot) {
+            if (v.superview != tb) return NO;
+        }
+    }
+    return YES;
+}
+
+// 尝试绑定（只在原始布局下会成功）。已绑定且仍有效则直接返回 YES。
+static BOOL JTBindDrawnSlots(UITabBar *tb, NSInteger totalSlots) {
+    if (!tb || totalSlots <= 0) return NO;
+    if (JTDrawnBindingAlive(tb)) return YES;
+
+    gJTDrawnSlots = nil;      // 失效就整体解绑，重新来
+
+    CGFloat W = tb.bounds.size.width;
+    if (W <= 1.0) W = tb.frame.size.width;
+    if (W <= 1.0) return NO;
+    CGFloat slotW = W / (CGFloat)totalSlots;
+
+    NSArray<UIView *> *cand = JTSlotDecorationCandidates(tb, slotW);
+    NSMutableArray<NSMutableArray<UIView *> *> *slots = [NSMutableArray array];
+    for (NSInteger i = 0; i < totalSlots; i++) [slots addObject:[NSMutableArray array]];
+
+    NSUInteger unmatched = 0;
+    for (UIView *v in cand) {
+        CGFloat cx = v.center.x;
+        NSInteger best = -1;
+        double bestD = 1e9;
+        for (NSInteger i = 0; i < totalSlots; i++) {
+            double want = (double)(slotW * ((CGFloat)i + 0.5));
+            double d = fabs((double)cx - want);
+            if (d < bestD) { bestD = d; best = i; }
+        }
+        // 容差 = 0.45 个槽宽。落在两个槽位中间（比如装饰线的中点）就不认 —— 宁可不绑。
+        if (best >= 0 && bestD <= (double)slotW * 0.45) {
+            [slots[(NSUInteger)best] addObject:v];
+        } else {
+            unmatched++;
+        }
+    }
+
+    // ★ 放弃条件：必须**每个槽位都有**候选。少一个就说明布局不是我们认识的那套
+    //   （App 改了结构，或者我们看到的已经是自己改过之后的状态）→ 不绑、不动。
+    NSUInteger covered = 0;
+    for (NSMutableArray<UIView *> *s in slots) if (s.count > 0) covered++;
+    if (covered < (NSUInteger)totalSlots) {
+        NSString *key = [NSString stringWithFormat:@"bind%lu/%ld/u%lu",
+                         (unsigned long)covered, (long)totalSlots, (unsigned long)unmatched];
         if (![gJTDrawnWarnKey isEqualToString:key]) {
             gJTDrawnWarnKey = key;
             NSMutableString *sub = [NSMutableString string];
             JTDescribeTabBarSubviews(tb, sub);
-            JTDiag(@"[tab自绘·%@] 自绘图标 %lu 个 ≠ 预期槽位 %ld 个 → 本项**不做任何改动**，"
-                    "只记录。当前 tab bar 直接子视图：\n%@",
-                   reason, (unsigned long)items.count, (long)totalSlots, sub);
+            JTDiag(@"[tab自绘] 绑定失败：只认到 %lu/%ld 个槽位（%lu 个候选落不到槽位上）"
+                    "→ 本项**不做任何改动**，只记录。当前 tab bar 直接子视图：\n%@",
+                   (unsigned long)covered, (long)totalSlots, (unsigned long)unmatched, sub);
         }
-        return;
+        return NO;
     }
 
-    NSMutableArray<UIView *> *kept = [NSMutableArray array];
-    NSUInteger nHide = 0, nShow = 0;
-    for (NSUInteger i = 0; i < items.count; i++) {
-        UIView *v = items[i];
-        if ([removedIdx containsObject:@(i)]) {
-            if (!v.hidden) {
-                v.hidden = YES;
-                nHide++;
-            }
-        } else {
-            if (v.hidden) {
-                v.hidden = NO;
-                nShow++;
-            }
-            [kept addObject:v];
-        }
+    gJTDrawnSlots = [slots copy];
+    gJTDrawnWarnKey = nil;
+    NSMutableString *s = [NSMutableString string];
+    for (NSUInteger i = 0; i < slots.count; i++) {
+        [s appendFormat:@"\n      槽%lu(%lu 个): %@", (unsigned long)i,
+         (unsigned long)slots[i].count, JTDescribeSlotViews(slots[i])];
     }
+    JTDiag(@"[tab自绘] 已绑定槽位（槽宽 %.1f）：%@", (double)slotW, s);
+    return YES;
+}
+
+static NSString *JTDrawnSlotsStateString(void) {
+    if (!gJTDrawnSlots) return @"(未绑定)";
+    NSMutableString *s = [NSMutableString string];
+    for (NSUInteger slot = 0; slot < gJTDrawnSlots.count; slot++) {
+        NSArray<UIView *> *slotViews = gJTDrawnSlots[slot];
+        [s appendFormat:@"\n      槽%lu: %@", (unsigned long)slot,
+         JTDescribeSlotViews(slotViews)];
+    }
+    return s;
+}
+
+// 按槽位隐藏/显示 + 把保留的槽位重排到整条宽度上。
+// removedIdx 为空数组 = 全部恢复显示并重排回原始槽位（长按 T 的恢复路径）。
+//
+// 为什么要重排而不是只隐藏：只 hidden=YES 的话，保留的两项仍在原槽位（靠右），
+// 左边空着 —— 一眼就是坏的。重排公式 (k+0.5)×W/n 与系统按钮自己的重排一致。
+static void JTFixDrawnTabItems(UITabBar *tb, NSInteger totalSlots,
+                               NSArray<NSNumber *> *removedIdx, NSString *reason) {
+    if (!tb || totalSlots <= 0) return;
+    if (!JTBindDrawnSlots(tb, totalSlots)) return;   // 绑定失败时内部已经记过日志
 
     CGFloat W = tb.bounds.size.width;
     if (W <= 1.0) W = tb.frame.size.width;
-    NSUInteger n = kept.count;
-    NSUInteger nMoved = 0;
-    if (n > 0 && W > 1.0) {
-        CGFloat slot = W / (CGFloat)n;
+    if (W <= 1.0) return;
+
+    NSMutableArray<NSNumber *> *keptSlots = [NSMutableArray array];
+    NSUInteger nHide = 0, nShow = 0, nMoved = 0;
+    for (NSUInteger slot = 0; slot < gJTDrawnSlots.count; slot++) {
+        BOOL rm = [removedIdx containsObject:@(slot)];
+        if (!rm) [keptSlots addObject:@(slot)];
+        NSArray<UIView *> *slotViews = gJTDrawnSlots[slot];
+        for (UIView *v in slotViews) {
+            if (rm) {
+                if (!v.hidden) { v.hidden = YES; nHide++; }
+            } else {
+                if (v.hidden) { v.hidden = NO; nShow++; }
+            }
+        }
+    }
+
+    NSUInteger n = keptSlots.count;
+    if (n > 0) {
+        CGFloat slotW = W / (CGFloat)n;
         for (NSUInteger k = 0; k < n; k++) {
-            UIView *v = kept[k];
-            CGPoint c = v.center;
-            CGFloat want = slot * ((CGFloat)k + 0.5);
-            if (fabs((double)(c.x - want)) > 0.5) {
-                c.x = want;
-                v.center = c;
-                nMoved++;
+            NSUInteger slot = (NSUInteger)[keptSlots[k] unsignedIntegerValue];
+            CGFloat want = slotW * ((CGFloat)k + 0.5);
+            NSArray<UIView *> *slotViews = gJTDrawnSlots[slot];
+            for (UIView *v in slotViews) {
+                CGPoint c = v.center;
+                if (fabs((double)(c.x - want)) > 0.5) {
+                    c.x = want;
+                    v.center = c;
+                    nMoved++;
+                }
             }
         }
     }
 
     if (nHide || nShow || nMoved) {
-        JTDiag(@"[tab自绘·%@] 隐藏 %lu / 恢复显示 %lu / 重排 %lu（保留 %lu 项，槽宽 %.1f）",
-               reason, (unsigned long)nHide, (unsigned long)nShow, (unsigned long)nMoved,
-               (unsigned long)n, (n > 0 && W > 1.0) ? (double)(W / (CGFloat)n) : 0.0);
+        JTDiag(@"[tab自绘·%@] 隐藏 %lu / 恢复显示 %lu / 重排 %lu（保留 %lu 个槽位）",
+               reason, (unsigned long)nHide, (unsigned long)nShow,
+               (unsigned long)nMoved, (unsigned long)n);
+    }
+
+    // ★ 结果自证：把每个槽位的**最终状态**打出来，且只在状态变化时打一次。
+    //   上一轮就是因为没有这一行 —— 日志里只有"隐藏 1 / 恢复显示 1"这种
+    //   无法判断对错的计数，得靠 x 坐标反推，白绕了一圈。
+    NSString *state = JTDrawnSlotsStateString();
+    if (![gJTDrawnStateKey isEqualToString:state]) {
+        gJTDrawnStateKey = state;
+        JTDiag(@"[tab自绘·结果·%@] %@", reason, state);
     }
 }
+
 
 // 应用规则。**可重复调用**：状态已经对了就一个字节都不改。
 // 调用点：启动、定时复检链、每次页面出现（节流）、悬浮按钮 T。
@@ -1692,6 +1842,13 @@ static void JTApplyTabRule(NSString *reason) {
                    (unsigned long)gJTOrigVCs.count, (long)gJTOrigSel,
                    [rm componentsJoinedByString:@","], JTTagListOf(gJTOrigVCs));
         }
+
+        // ★★ 自绘层必须**在这里**绑定 —— 也就是在 `setViewControllers:` **之前**。
+        //   理由：App 很可能在我们那次 `setViewControllers:` 里就把自绘图标重排成
+        //   "只剩 N 个槽位"的样子（实测就是这样）。那时再按"槽位中心"去认身份，
+        //   会有一堆图标叠在同一个 x 上 → 认不全 → 绑定失败 → 整项放弃。
+        //   现在这一刻 tab bar 还是原始 5 槽位布局，是**唯一**可靠的绑定时机。
+        JTBindDrawnSlots(tbc.tabBar, (NSInteger)gJTOrigVCs.count);
 
         // ---- 按**留底的原始顺序**算保留集 ----
         // 不按 cur 现算：cur 可能已经被我们改过，那样每轮算出来的结果都可能不同。
@@ -1732,9 +1889,17 @@ static void JTApplyTabRule(NSString *reason) {
                 origRemoved = ![kept containsObject:orig];
             }
             if (outOfRange || origRemoved) {
-                if (tbc.selectedIndex != want) tbc.selectedIndex = want;
-                JTDiag(@"[tab规则·%@] selectedIndex %ld → %ld（原选中项已被移除或越界）",
-                       reason, (long)sel, (long)want);
+                // 只在**真的改了**的时候记一行"→"；没改就记"保持"，否则日志里会出现
+                // "selectedIndex 0 → 0" 这种看起来改了其实没改的行，读日志的人会以为有问题。
+                if (tbc.selectedIndex != want) {
+                    tbc.selectedIndex = want;
+                    JTDiag(@"[tab规则·%@] selectedIndex %ld → %ld（原选中项已被移除或越界）",
+                           reason, (long)sel, (long)want);
+                } else {
+                    JTDiag(@"[tab规则·%@] selectedIndex 保持 %ld"
+                            "（原选中项已被移除，但过滤后同一位置正好是保留项）",
+                           reason, (long)want);
+                }
             }
         } else if (outOfRange) {
             tbc.selectedIndex = want;
