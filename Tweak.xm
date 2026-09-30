@@ -1,6 +1,6 @@
 // ============================================================================
 // Tweak.xm — 无忧行 (com.cmi.jegotrip) 界面精简 Tweak
-// v0.3.1 —— 修掉 v0.3 首轮真机暴露的「自绘层认错槽位」bug
+// v0.3.2 —— 目标 ① 已达成；加 tab bar 深挖诊断，定位残留的凸起装饰
 // ============================================================================
 // 目标（已与 Shawn 确认）：
 //   1) 把「首页 / 目的地 / 流量」这三个 **tab 从导航栏移除**，App 直接落到剩下的 tab；
@@ -85,6 +85,14 @@
 // 顺带把"槽位装饰"的收集范围从 `FLAnimatedImageView` 放宽到**所有按槽位摆放的直接子视图**
 // —— tab 2（流量）的凸起装饰是两个普通 `UIView`，原来漏了。
 // 完整证据链与推导见第 12b 节 JTBindDrawnSlots 上面的注释。
+//
+// ---------------------------------------------------------------------------
+// v0.3.2：目标 ① 达成，转去定位"残留的凸起装饰"
+// ---------------------------------------------------------------------------
+// v0.3.1 真机结果：5 个槽位装饰全部 `[隐]`，保留 2 个均分摆放，全程无反复。
+// 但导航栏中间仍可见"凸起圆点的上半部分"。**直接子视图清单看不出它是什么**
+// （所有槽位装饰都已经 [隐]），所以新增第 6c 节的 tab bar 深挖：
+// 子树（深度 3）+ 非视图的 CALayer + tab bar 的兄弟视图，三样一起打，只在长按 JT 时输出。
 // ============================================================================
 
 #import <UIKit/UIKit.h>
@@ -107,7 +115,7 @@
 // ============================== 配置 ==============================
 
 #define JT_TAG              "JegoTidy"
-#define JT_VERSION          "0.3.1"
+#define JT_VERSION          "0.3.2"
 #define JT_BUNDLE_ID        "com.cmi.jegotrip"
 
 #define ENABLE_CRASH_LOG         1   // 崩溃取证
@@ -283,6 +291,9 @@ static void JTLaunchGuardReset(void);
 static void JTInstallFloatButton(void);
 static void JTInstallAfterLaunch(void);
 static void JTLogTabBarState(NSString *reason);
+static void JTDescribeSubtree(UIView *v, NSUInteger depth, NSUInteger maxDepth,
+                              NSUInteger *budget, NSMutableString *s);
+static NSString *JTDescribeTabBarDeep(UITabBar *tb, NSUInteger maxDepth);
 
 // v0.3 ① tab 规则引擎（第 12b 节）
 static NSArray<NSNumber *> *JTKeepTagList(void);
@@ -1069,6 +1080,80 @@ static void JTLogTabBarState(NSString *reason) {
         JTDiag(@"[TabBar状态·%@]\n%@", reason, desc);
     } @catch (NSException *e) {
     }
+}
+
+// ============================== 6c. tab bar 深挖（v0.3.2） ==============================
+//
+// 为什么需要它：v0.3.1 之后目标 ① 已经达成 —— tab bar 的**直接子视图**里 5 个槽位装饰
+// 全部 `[隐]`，保留的 2 个均分摆放。但用户仍看到"中间残留的凸起圆点上半部分"。
+// 说明残留物不在直接子视图里，只剩三种可能，而直接子视图清单**一种都看不出来**：
+//   ① 藏在某个容器子视图**里面**（比如 `子[1] UIView (0,0,430,89)` 里）
+//   ② 是直接 `addSublayer:` 上去的 **CALayer** —— 既不在 `subviews` 里，也不受 `hidden` 影响
+//   ③ 是 tab bar 的**兄弟视图**（挂在 tab bar 的父视图上，不在 tab bar 子树里）
+// 所以三样一起打。★ 只在**长按 JT** 时输出 —— 它是定位用的，不该每秒跑。
+static void JTDescribeSubtree(UIView *v, NSUInteger depth, NSUInteger maxDepth,
+                              NSUInteger *budget, NSMutableString *s) {
+    if (!v || depth > maxDepth || !budget || *budget == 0) return;
+    (*budget)--;
+
+    NSMutableString *indent = [NSMutableString string];
+    for (NSUInteger i = 0; i < depth; i++) [indent appendString:@"  "];
+
+    NSString *ownText = nil;
+    if ([v isKindOfClass:[UILabel class]]) ownText = ((UILabel *)v).text;
+
+    [s appendFormat:@"\n%@%@%@ (%.0f,%.0f,%.0f,%.0f) α=%.2f%@",
+        indent, NSStringFromClass([v class]),
+        v.hidden ? @" [隐]" : @" [显]",
+        (double)v.frame.origin.x, (double)v.frame.origin.y,
+        (double)v.frame.size.width, (double)v.frame.size.height,
+        (double)v.alpha,
+        ownText.length ? [NSString stringWithFormat:@" 文字=[%@]", ownText] : @""];
+
+    // 非视图的 layer：视图自己的 backing layer 也会出现在父层的 sublayers 里，
+    // 用 isKindOfClass:UIView 把它们排掉，剩下的就是**手工 addSublayer:** 上去的装饰 ——
+    // 这类东西 `hidden` 管不到，只能靠这条日志发现。
+    for (CALayer *l in v.layer.sublayers) {
+        if ([l isKindOfClass:[UIView class]]) continue;
+        [s appendFormat:@"\n%@  ⤷layer %@ (%.0f,%.0f,%.0f,%.0f) hidden=%d",
+            indent, NSStringFromClass([l class]),
+            (double)l.frame.origin.x, (double)l.frame.origin.y,
+            (double)l.frame.size.width, (double)l.frame.size.height,
+            l.hidden ? 1 : 0];
+    }
+
+    for (UIView *c in v.subviews) JTDescribeSubtree(c, depth + 1, maxDepth, budget, s);
+}
+
+static NSString *JTDescribeTabBarDeep(UITabBar *tb, NSUInteger maxDepth) {
+    if (!tb) return @"(nil)\n";
+    NSMutableString *s = [NSMutableString string];
+    NSUInteger budget = 300;
+
+    [s appendString:@"\n  --- tab bar 子树（含隐藏项）---"];
+    JTDescribeSubtree(tb, 0, maxDepth, &budget, s);
+    if (budget == 0) [s appendString:@"\n  …(节点预算用尽，已截断)"];
+
+    // 兄弟视图：凸起装饰也可能挂在 tab bar 的父视图上（那就不在 tab bar 子树里）
+    UIView *sup = tb.superview;
+    if (sup) {
+        [s appendFormat:@"\n  --- tab bar 的父视图 %@ 的其它子视图 ---",
+            NSStringFromClass([sup class])];
+        NSUInteger n = 0;
+        for (UIView *sib in sup.subviews) {
+            if (sib == tb) continue;
+            [s appendFormat:@"\n    %@%@ (%.0f,%.0f,%.0f,%.0f)",
+                NSStringFromClass([sib class]), sib.hidden ? @" [隐]" : @" [显]",
+                (double)sib.frame.origin.x, (double)sib.frame.origin.y,
+                (double)sib.frame.size.width, (double)sib.frame.size.height];
+            n++;
+            if (n > 40) {
+                [s appendString:@"\n    …(更多略)"];
+                break;
+            }
+        }
+    }
+    return s;
 }
 
 // ============================== 7. 弹窗 / 开屏广告取证 ==============================
@@ -2169,6 +2254,13 @@ static void JTStartAdSweepTimer(void) {
     @try {
         // 长按那一刻才生成文本（而不是提前冻结），保证拿到的是最新、最全的
         JTLogTabBarState(@"长按");
+        // tab bar 深挖：目标 ① 达成后仍可能有"看不出出处"的装饰物留在导航栏上，
+        // 而**直接子视图清单看不出这件事**（v0.3.1 实测：直接子视图全 [隐]，
+        // 用户仍看到残留凸起）。所以子树 / 非视图 layer / 兄弟视图三样一起打。
+        UITabBarController *tbc = JTFindTabBarController();
+        if (tbc && tbc.tabBar) {
+            JTDiag(@"[tabBar深挖·长按]%@", JTDescribeTabBarDeep(tbc.tabBar, 3));
+        }
         NSString *snap = JTDiagSnapshot();
         UIPasteboard.generalPasteboard.string = snap;
         [self flash:[NSString stringWithFormat:@"ALL %lu", (unsigned long)snap.length]];
