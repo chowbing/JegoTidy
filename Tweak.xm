@@ -15,14 +15,18 @@
 //   ③ 清广告位          → 第 12c 节（JTSweepBlockAds + 定时器）
 //
 // 使用方式（真机）：
-//   1) 打开 App。右上角两个小圆点（都可拖动）：
-//        · 蓝色 JT —— 点 = 抓当前页并复制（含「广告候选汇总」）；长按 = 复制全部诊断
-//        · 橙色 T  —— 点 = 手动再应用一次 tab 规则；长按 = **恢复原始 5 个 tab + 恢复所有被隐藏的广告 + 停手**
-//   2) 正常用一遍：切切 tab、进各页面、把启动时看到的弹窗复现一次。
-//   3) **长按 JT** → 完整诊断写进剪贴板 → 粘贴回来。
+//   **发布版（`ENABLE_DEBUG_UI = 0`，当前）**：装好即用，界面上**没有任何我们的东西** ——
+//   没有悬浮按钮、没有日志。规则在启动后自己生效。
+//     1) 打开 App 正常用：只剩「电话·消息」「我的」两个 tab，广告位被清掉。
+//     2) 出问题怎么办：**在 TrollFools 里把这个插件的注入关掉** → 立刻完全回到原版，
+//        不用重新构建、不用重装。（比调试版的"长按 T"更彻底：T 只恢复本次启动。）
 //
-// ★ 后悔药：如果 tab 删错了（比如「流量」其实不是我们以为的那个），**长按橙色 T**
-//   即可当场恢复原始 5 个 tab，并在本次启动内不再应用规则。不用重装、不用重启。
+//   **调试版（把 `ENABLE_DEBUG_UI` 改成 1 重新构建）**：右上角出现两个可拖动小圆点：
+//     · 蓝色 JT —— 点 = 抓当前页并复制（含「广告候选汇总」）；长按 = 复制全部诊断
+//     · 橙色 T  —— 点 = 手动再应用一次 tab 规则；长按 = **恢复原始 5 个 tab + 恢复所有
+//                  被隐藏的广告 + 撤销三类类级覆写 + 停手**（现场后悔药，不用重装重启）
+//     排查流程：打开 App 正常用一遍（切 tab、进各页面、把启动弹窗复现一次）→
+//     长按 JT → 完整诊断进剪贴板 → 粘贴回来。
 //
 // 安全设计（每一条都对应上一轮踩过的坑）：
 //   · 诊断钩子绝不放在启动路径：%ctor 只装崩溃处理器，其余 dispatch 到主队列。
@@ -31,11 +35,12 @@
 //      且 @try/@catch 救不了 —— 异常在 dispatch_once 里被 libdispatch 边界吞掉）。
 //   · 通用 hook 安装器先按"是不是某根类的后代"做廉价预筛，再对每个类做一次
 //     class_copyMethodList；否则为全进程几万个类各做一次会卡住启动一两秒。
-//   · 启动自愈计数：同一构建连续 3 次启动异常 → 本次只留悬浮按钮、不装任何钩子。
+//   · 启动自愈计数：同一构建连续 3 次启动异常 → 本次不装任何钩子（调试版还会留悬浮按钮）。
 //   · 诊断缓冲用滚动窗口 + 显式截断标记，绝不"写满就静默停止"。
 //   · 信号处理函数里只用 open/write/snprintf/backtrace_*（异步信号安全）。
 //   · v0.3 新增的每处"改界面"都有对应的放弃条件（匹配不上就不动）、幂等保证、
-//     以及一个现场可用的撤销入口（长按 T）。详见文件头下面那段。
+//     以及一个现场可用的撤销入口（调试版的"长按 T"；发布版则是 TrollFools 关闭注入）。
+//     详见文件头下面那段。
 //
 // ---------------------------------------------------------------------------
 // v0.3 相对 v0.2 的变更（依据 = 2026-09-30 v0.2b 真机 dump，不是推断）
@@ -192,6 +197,12 @@
 //      （委托自己实现了该方法的情形例外：那是"换掉并转发"，不改变语义。）
 // 长按 T 的后悔药再扩展：把 size 覆写换回原实现（`class_addMethod` 上去的那批换成"直通版"，
 // 否则恢复后广告会以 0.5pt 被压扁 —— 比不恢复更怪）。
+//
+// 另外：**发布版关掉调试 UI**（`ENABLE_DEBUG_UI = 0`）—— 去掉右上角那两个圆点和全部取证日志。
+// 关掉它们不影响任何规则；现场后悔药由"在 TrollFools 里关闭注入"替代（更彻底且不用重装）。
+// 顺带发现并修掉一个命名陷阱：`ENABLE_POPUP_FORENSICS` 名字像"纯取证"，
+// 实际却门控着**目标 ② 赖以生效的那个钩子的安装**（拦截动作在 `JTPresentHook` 内部）。
+// 现已把"安装"与"日志"拆开，见配置块。
 // ============================================================================
 
 #import <UIKit/UIKit.h>
@@ -217,12 +228,33 @@
 #define JT_VERSION          "1.1"
 #define JT_BUNDLE_ID        "com.cmi.jegotrip"
 
-#define ENABLE_CRASH_LOG         1   // 崩溃取证
-#define ENABLE_FLOAT_BUTTON      1   // 悬浮按钮
-#define ENABLE_TABBAR_FORENSICS  1   // tab bar 构造过程取证
-#define ENABLE_POPUP_FORENSICS   1   // 弹窗 / 开屏广告取证
-#define ENABLE_OVERLAY_FORENSICS 1   // UIWindow addSubview: 里的广告类取证
-#define ENABLE_CLASS_SCAN        1   // 全进程类名扫描（一次性，+3s 跑）
+// ---- 调试界面 / 取证：发布版一律关掉，改 1 行就能拿回完整调试能力 ----
+//
+// ★ `ENABLE_DEBUG_UI = 0`（v1.1 最终版）= 没有悬浮按钮、没有取证日志。
+//   为什么发布版要关：那两个圆点是**调试 UI**，日常用不该看见；而且它们会一直挂在屏幕上
+//   （虽然可拖、可点，但终究是多余的东西）。关掉之后**不影响任何一条规则**：
+//     · 启动自愈（连续 3 次启动异常就停手）用的是自己的文件 `wf_launch.txt`，与按钮无关；
+//     · 崩溃取证 `wf_crash.log` 走信号处理器，与按钮无关；
+//     · 三条规则线全部照常。
+//   **失去了什么**：现场后悔药（长按橙色 T 恢复 5 tab + 恢复被隐藏广告 + 撤销类级覆写）。
+//   但它有等价替代 —— **在 TrollFools 里把这个插件的注入关掉**即可完全回到原版，
+//   不用重新构建、不用重装，而且比 T 更彻底（T 只恢复本次启动，TrollFools 是持久的）。
+//   想再拿回按钮/日志：把 `ENABLE_DEBUG_UI` 改成 1，重新构建。
+#define ENABLE_DEBUG_UI          0   // ★ 发布版 0 / 调试版 1
+
+#define ENABLE_CRASH_LOG         1   // 崩溃取证（被动，只在真崩的时候写文件）—— 发布版保留
+#define ENABLE_FLOAT_BUTTON      ENABLE_DEBUG_UI   // 悬浮按钮（蓝 JT / 橙 T）
+#define ENABLE_TABBAR_FORENSICS  ENABLE_DEBUG_UI   // tab bar 构造过程取证（纯日志）
+#define ENABLE_OVERLAY_FORENSICS ENABLE_DEBUG_UI   // UIWindow addSubview: 里的广告类取证（纯日志）
+#define ENABLE_CLASS_SCAN        ENABLE_DEBUG_UI   // 全进程类名扫描（一次性，+3s 跑，重活）
+//
+// ★★ `ENABLE_POPUP_FORENSICS` **必须保持 1，它不归 ENABLE_DEBUG_UI 管**（2026-09-30 发现）：
+//   它的名字叫"取证"，但它实际门控的是 `presentViewController:` 钩子的**安装**，
+//   而**目标 ②（拦开屏/启动弹窗）的拦截动作就在那个钩子内部**（`JTPresentHook` 里的
+//   `shouldDismiss` + 延迟 dismiss）。把它关掉 = 目标 ② 静默失效，而且日志上什么都看不出来。
+//   v1.1 已把两件事拆开：**安装**看 `(ENABLE_POPUP_BLOCK || ENABLE_POPUP_FORENSICS)`，
+//   **日志**看 `ENABLE_POPUP_FORENSICS`。所以现在把它置 0 只丢日志，不会丢功能。
+#define ENABLE_POPUP_FORENSICS   1   // 弹窗取证（纯日志；安装与否见上面那条说明）
 
 // ---- v0.3 新开的三条线（对应三个目标） ----
 #define ENABLE_TAB_RULE          1   // ① 移除「首页 / 目的地 / 流量」三个 tab
@@ -490,7 +522,8 @@ static NSUInteger JTAdItemCollapseUndo(void);
 // v0.3 ② 开屏 / 弹窗判定（第 7 节用到）
 static BOOL JTClassLooksLikeSplashOrPopup(NSString *cn);
 
-// ============================== 0. 悬浮按钮的窗口 ==============================
+// ============================== 0. 悬浮按钮的窗口（仅调试版） ==============================
+// 整节由 `ENABLE_FLOAT_BUTTON` 门控；发布版（`ENABLE_DEBUG_UI = 0`）这个窗口根本不会被创建。
 
 // 只让按钮本身接收触摸，其余区域穿透到 App（否则会挡住整个屏幕）。
 @interface JTOverlayWindow : UIWindow
@@ -1683,12 +1716,18 @@ static void JTPresentHook(id self, SEL _cmd, id vcToPresent, BOOL animated,
     NSString *pcn = vcToPresent ? NSStringFromClass([vcToPresent class]) : nil;
     BOOL shouldDismiss = NO;
     @try {
+        // ★ 取证日志与拦截判定**分开**：前者是 `ENABLE_POPUP_FORENSICS`（纯日志，发布版可关），
+        //   后者是 `ENABLE_POPUP_BLOCK`（功能）。以前两者混在一个 `#if` 下，
+        //   于是"关掉取证"会顺手把目标 ② 一起关掉 —— 见配置块里那段说明。
+#if ENABLE_POPUP_FORENSICS
         NSString *key = [NSString stringWithFormat:@"%@ → %@",
                          NSStringFromClass([self class]),
                          vcToPresent ? NSStringFromClass([vcToPresent class]) : @"(nil)"];
         NSArray<NSString *> *stack = nil;
+        // `callStackSymbols` 要符号化，很贵 —— 只在"这一类第一次出现"时才抓（见 JTShouldCapturePresentStack）
         if (JTShouldCapturePresentStack(key)) stack = [NSThread callStackSymbols];
         JTNotePresent(key, stack);
+#endif
 #if ENABLE_POPUP_BLOCK
         if (pcn && JTClassLooksLikeSplashOrPopup(pcn)) shouldDismiss = YES;
 #endif
@@ -1721,7 +1760,9 @@ static void JTPresentHook(id self, SEL _cmd, id vcToPresent, BOOL animated,
 }
 
 static void JTInstallPresentHooks(void) {
-#if ENABLE_POPUP_FORENSICS
+// ★ 条件必须是 **或**：`ENABLE_POPUP_BLOCK`（功能）需要这个钩子，
+//   `ENABLE_POPUP_FORENSICS`（日志）也需要。只写 FORENSICS 会让"关掉日志"顺带废掉功能。
+#if (ENABLE_POPUP_BLOCK || ENABLE_POPUP_FORENSICS)
     @try {
         if (!gJTSelPresent)
             gJTSelPresent = NSSelectorFromString(@"presentViewController:animated:completion:");
@@ -1993,7 +2034,8 @@ static void JTInstallViewDidAppearHooks(void) {
 
 // ============================== 11. 启动自愈计数 ==============================
 // 最难受的失败不是崩溃，是"崩到 App 完全打不开"—— 那样连诊断都拿不到。
-// 规则：同一构建 token 连续 3 次启动都走到这里 → 本次不装任何钩子，只留悬浮按钮。
+// 规则：同一构建 token 连续 3 次启动都走到这里 → 本次不装任何钩子（调试版还会留悬浮按钮，
+// 好让用户仍能长按取到崩溃报告）。
 // token 变了（= 重新构建过）自动从 0 开始，所以修好后无需手动清文件。
 
 static NSString *JTGuardFilePath(void) {
@@ -3922,7 +3964,10 @@ static void JTStartAdSweepTimer(void) {
 }
 
 
-// ============================== 12. 悬浮按钮 ==============================
+// ============================== 12. 悬浮按钮（仅调试版） ==============================
+// ★ 发布版（`ENABLE_DEBUG_UI = 0`）不创建这个窗口 —— 界面上看不到任何我们的东西。
+//   下面这一节 + 第 0 节的窗口类，只有把 `ENABLE_DEBUG_UI` 改成 1 重新构建后才存在。
+//   发布版想要"撤销"，用 TrollFools 关掉注入即可（比下面的长按 T 更彻底）。
 
 @implementation JTBtnHandler
 
@@ -4149,10 +4194,13 @@ static void JTInstallAfterLaunch(void) {
     // 类名扫描是一次性重活（几万个类跑正则），既不放启动路径，也不放主线程 ——
     // 它只做 objc_getClassList / class_getName / class_getSuperclass 这些只读运行时查询，
     // 天然线程安全；JTDiag 内部有锁，可以安全地在后台写。
+    // 纯诊断（结果只进诊断缓冲、靠悬浮按钮读出来）→ 发布版连这一次调度都不必发生。
+#if ENABLE_CLASS_SCAN
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
         JTScanInterestingClasses();
     });
+#endif
 
     JTStageSet("安装完成");
     JTDiag(@"[启动] %s %s 已加载", JT_TAG, JT_VERSION);
