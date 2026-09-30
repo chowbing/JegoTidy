@@ -77,10 +77,21 @@ static volatile const char *gJTStage = "启动";
 static NSMutableString *gJTDiag = nil;
 static BOOL             gJTDiagTruncated = NO;
 
-static NSMutableDictionary<NSString *, NSValue *> *gJTOrigVDAMap = nil;
-static NSMutableDictionary<NSString *, NSValue *> *gJTOrigSetVCsMap = nil;
-static NSMutableDictionary<NSString *, NSValue *> *gJTOrigSetVCsAnimMap = nil;
-static NSMutableDictionary<NSString *, NSValue *> *gJTOrigPresentMap = nil;
+// ★ 一个 selector 只挂**一个类**，所以原 IMP 也是**一个** —— 不是字典。
+// 为什么（2026-09-30 真机栈溢出实测，见 JTInstallSingleHook 上面的长注释）：
+// 一旦让一个共享 shim 服务多个类，就必须靠"从对象类沿父类链找第一份原 IMP"来转发，
+// 而这个查法**无法区分"直接调用"和"[super] 调用"** → 必然无限递归。
+// 收敛成"每个 selector 一个原 IMP"之后，转发是常量时间且不可能回到自己。
+static IMP gJTOrigVDA = NULL;          // UIViewController.viewDidAppear:
+static IMP gJTOrigSetVCs = NULL;       // UITabBarController.setViewControllers:
+static IMP gJTOrigSetVCsAnim = NULL;   // UITabBarController.setViewControllers:animated:
+static IMP gJTOrigPresent = NULL;      // UIViewController.presentViewController:animated:completion:
+
+// 实际挂上的类名（仅用于诊断输出；挂载失败时保持 nil）
+static NSString *gJTHookedVDA = nil;
+static NSString *gJTHookedSetVCs = nil;
+static NSString *gJTHookedSetVCsAnim = nil;
+static NSString *gJTHookedPresent = nil;
 
 static SEL gJTSelVDA = NULL;
 static SEL gJTSelSetVCs = NULL;
@@ -122,9 +133,7 @@ static Method JTFindMethodInChain(Class c, SEL sel, Class *outOwner);
 static Method JTSafeInstanceMethod(Class c, SEL sel);
 static Method JTOwnMethod(Class c, SEL sel);
 static BOOL   JTIsDescendantOf(Class c, Class root);
-static NSUInteger JTInstallHooksUnderRootClass(const char *rootName, SEL sel, IMP replacement,
-                                               NSMutableDictionary<NSString *, NSValue *> *store);
-static IMP JTOriginalIMPFor(id self, NSMutableDictionary<NSString *, NSValue *> *store);
+static BOOL   JTInstallSingleHook(const char *className, SEL sel, IMP replacement, IMP *outOrig);
 
 static void JTDiag(NSString *fmt, ...);
 static NSString *JTDiagSnapshot(void);
@@ -225,6 +234,11 @@ static void JTAppendCrashFile(const char *text) {
 // 信号处理函数里只允许**异步信号安全**的调用：open/write/close/snprintf/backtrace_*。
 // 绝不碰 NSString / NSFileManager / NSLog —— 它们会分配内存，导致二次崩溃。
 // 处理完必须恢复默认动作并重新 raise，否则进程带着损坏状态继续跑，会被看门狗当卡死杀掉。
+//
+// ★ 关于 backtrace()：因为处理器现在跑在**备用栈**上（见 JTInstallCrashHandlers），
+//   backtrace() 走的是备用栈，拿不到出问题那条栈的帧 —— 它只能证明"处理器确实执行了"。
+//   出问题那条栈的完整帧链请以系统生成的 .ips 为准（设置 → 隐私与安全性 → 分析与改进）。
+//   本日志真正独有的、.ips 里**没有**的信息是：**阶段标记**（崩在哪一步）。
 static void JTSignalHandler(int sig) {
     char head[256];
     int n = snprintf(head, sizeof(head), "\n===== SIGNAL %d =====\n阶段: %s\n", sig, JTStageText());
@@ -275,9 +289,42 @@ static void JTInitCrashLogPath(void) {
 static void JTInstallCrashHandlers(void) {
 #if ENABLE_CRASH_LOG
     NSSetUncaughtExceptionHandler(&JTExceptionHandler);
+
+    // ★ 必须给信号处理器一块**独立栈**（sigaltstack + SA_ONSTACK）。
+    //   2026-09-30 实测踩到：真机闪退是**栈溢出**（无限递归 511 帧），
+    //   而我们的 wf_crash.log **一个字节都没写出来**，最后只能靠系统生成的 .ips 定位。
+    //   原因：默认情况下信号处理器跑在**已经耗尽、已经踩到守护页的那条栈**上，
+    //   第一条指令就二次 SIGSEGV → 再次进处理器 → 内核直接按默认动作终止进程。
+    //   所以"栈溢出"这一最常见的崩溃类型，恰好是原来唯一观测不到的类型。
+    //   注意 `signal()` 无法设置 SA_ONSTACK，必须换成 `sigaction()`。
+    //   另一个边界：备用栈是**每个线程各自一份**，而 sigaltstack() 只对当前线程生效。
+    //   这里在 %ctor 里调用 → 只有主线程有备用栈。子线程崩溃时本日志仍可能写不出来
+    //   （这类崩溃请直接看系统 .ips）。主线程崩溃是本项目的主要场景，先覆盖它。
+    static char *sAltStack = NULL;
+    if (!sAltStack) {
+        size_t sz = 128 * 1024;
+        sAltStack = (char *)malloc(sz);
+        if (sAltStack) {
+            stack_t ss;
+            memset(&ss, 0, sizeof(ss));
+            ss.ss_sp = sAltStack;
+            ss.ss_size = sz;
+            ss.ss_flags = 0;
+            if (sigaltstack(&ss, NULL) != 0) {
+                free(sAltStack);
+                sAltStack = NULL;
+            }
+        }
+    }
+
     int sigs[] = { SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGTRAP, SIGFPE };
     for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
-        signal(sigs[i], JTSignalHandler);
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = JTSignalHandler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_ONSTACK;   // ← 关键：在备用栈上运行处理器
+        sigaction(sigs[i], &sa, NULL);
     }
 #endif
 }
@@ -317,6 +364,7 @@ static Method JTOwnMethod(Class c, SEL sel) {
     return (owner == c) ? m : NULL;
 }
 
+// 纯指针比较，不发消息、不触发 +initialize。用于类名扫描时的廉价预筛。
 static BOOL JTIsDescendantOf(Class c, Class root) {
     if (!c || !root) return NO;
     for (Class k = c; k; k = class_getSuperclass(k)) {
@@ -325,52 +373,62 @@ static BOOL JTIsDescendantOf(Class c, Class root) {
     return NO;
 }
 
-// 通用 hook 安装器。
-// 为什么必须挂**每一个自己实现了该方法的类**：只挂基类的话，子类重写了同名方法时
-// objc_msgSend 直接落到子类实现上，我们的 hook 永远不会被调用（症状是"日志里连
-// 我们自己造的事件都没有"）。原 IMP 按类名存起来，调用时沿父类链找回正确的那份。
-static NSUInteger JTInstallHooksUnderRootClass(const char *rootName, SEL sel, IMP replacement,
-                                               NSMutableDictionary<NSString *, NSValue *> *store) {
-    if (!rootName || !sel || !replacement || !store) return 0;
-    Class root = objc_getClass(rootName);
-    if (!root) return 0;
+// ============================== 3b. hook 安装器 ==============================
+//
+// ★★ 这里曾经有一个"挂所有实现了该方法的子类"的通用安装器，2026-09-30 在真机上
+//    **栈溢出闪退**，崩溃报告铁证（主线程 511 帧，交替重复 200+ 次）：
+//
+//      #5  JTOriginalIMPFor(self, map)
+//      #6  JTViewDidAppearHook +76          ← 我们的 shim，正在查原 IMP
+//      #7  -[UITabBarController viewDidAppear:] +60   ← 转发到了 UIKit 的 tbc 实现
+//      #8  JTViewDidAppearHook +128         ← UIKit 里调 [super viewDidAppear:]，又落回我们的 shim
+//      #9  -[UITabBarController viewDidAppear:] +60   ← 查表**又**命中 tbc
+//      #10 JTViewDidAppearHook +128
+//      ...（一直重复到踩穿栈守护页，KERN_PROTECTION_FAILURE）
+//
+//    完整因果链：
+//      1. 我们挂了 UIViewController 和 UITabBarController **两个**类，
+//         共用同一个 shim `JTViewDidAppearHook`，原 IMP 存进按类名索引的字典。
+//      2. 调用 [tbc viewDidAppear:] → 落到 UITabBarController 的 method → 我们的 shim。
+//      3. shim 用 `JTOriginalIMPFor(self, map)` 找原 IMP：**从对象类沿父类链找第一个命中**，
+//         第一个就是 "UITabBarController" → 转发到 UIKit 的 tbc 实现。到这一步都对。
+//      4. UIKit 的 `-[UITabBarController viewDidAppear:]` 内部调 `[super viewDidAppear:]`。
+//         super 派发走的是 **UIViewController** 的 method list → 又是我们的 shim。
+//      5. shim 再查表 —— 而它**只知道对象是 tbc 子类**，从对象类往上找第一个命中的
+//         仍然是 "UITabBarController" → **又**转发到 UIKit 的 tbc 实现 → 回到第 4 步。
+//
+//    ★ 根因不是"查表写错了"，而是这个设计**在原理上无法区分"直接调用"和"[super] 调用"**：
+//      共享 shim 拿不到"当前执行的是哪个类的 method list 条目"这个信息。
+//      换句话说：**只要一个 shim 服务多个类，转发就不可判定**，改键、加特判都是治标。
+//
+//    ★ 所以改成：**一个 selector 只挂一个类**。原 IMP 唯一，shim 直接用它。
+//      终止性可以证明：[super S] 派发到的是**父类**的 method list，而父类我们**没碰**，
+//      于是走父类的原始实现；要再回到我们的 shim，必须有一次以该类为起点的 S 派发 ——
+//      那在改动前也会发生，App 本来能跑就说明它不会无限递归。
+//
+//    代价：子类**自己重写**了该方法且**不调用 super** 时我们观测不到。
+//      `viewDidAppear:` 这类回调 Apple 明确要求调用 super，绝大多数实现都会调，可接受。
+//      （这是"漏一层观测"和"App 完全打不开"之间的取舍，选前者。）
+static BOOL JTInstallSingleHook(const char *className, SEL sel, IMP replacement, IMP *outOrig) {
+    if (!className || !sel || !replacement) return NO;
+    Class c = objc_getClass(className);
+    if (!c) return NO;
 
-    int cnt = objc_getClassList(NULL, 0);
-    if (cnt <= 0) return 0;
-    Class *all = (Class *)malloc(sizeof(Class) * (size_t)cnt);
-    if (!all) return 0;
-    cnt = objc_getClassList(all, cnt);
+    // 只认"这个类**自己**实现"的方法。继承来的绝不碰：
+    // method_setImplementation 改的是 Method 对象，而继承来的 Method 属于父类，
+    // 改了会波及所有兄弟子类。
+    Method own = JTOwnMethod(c, sel);
+    if (!own) return NO;
 
-    NSUInteger hooked = 0;
-    for (int i = 0; i < cnt; i++) {
-        Class c = all[i];
-        if (!JTIsDescendantOf(c, root)) continue;   // 廉价预筛，避免对几万个类做 copyMethodList
-        unsigned int n = 0;
-        Method *ms = class_copyMethodList(c, &n);
-        if (!ms) continue;
-        Method own = NULL;
-        for (unsigned int j = 0; j < n; j++) {
-            if (method_getName(ms[j]) == sel) { own = ms[j]; break; }
-        }
-        free(ms);
-        if (!own) continue;
-        IMP orig = method_setImplementation(own, replacement);
-        if (orig) {
-            store[NSStringFromClass(c)] = [NSValue valueWithPointer:(const void *)orig];
-        }
-        hooked++;
-    }
-    free(all);
-    return hooked;
-}
+    // 幂等：已经装过就绝不二次安装。
+    // 二次安装的后果是 method_setImplementation 返回的是**我们自己的 shim**，
+    // 于是"原 IMP"变成 shim 自己 → 一调用就自递归。必须挡住。
+    if (method_getImplementation(own) == replacement) return NO;
 
-static IMP JTOriginalIMPFor(id self, NSMutableDictionary<NSString *, NSValue *> *store) {
-    if (!self || !store) return NULL;
-    for (Class k = object_getClass(self); k; k = class_getSuperclass(k)) {
-        NSValue *v = store[NSStringFromClass(k)];
-        if (v) return (IMP)v.pointerValue;   // void* -> IMP 必须显式强转（ObjC++ 下隐式转换是硬 error）
-    }
-    return NULL;
+    IMP orig = method_setImplementation(own, replacement);
+    if (!orig || orig == replacement) return NO;   // 双保险：拿到的绝不能是自己
+    if (outOrig) *outOrig = orig;
+    return YES;
 }
 
 // ============================== 4. 诊断缓冲 ==============================
@@ -702,6 +760,7 @@ static NSString *JTDescribeVCArray(NSArray *arr) {
 //   于是 setViewControllers: 的 hook 会转发到 animated 版那份 IMP，
 //   参数个数都对不上，而且对方也是我们的 hook → **无限递归，必崩**。
 static void JTSetVCsHook(id self, SEL _cmd, NSArray *vcs) {
+    IMP orig = gJTOrigSetVCs;          // 先抓快照，避免转发途中被改写
     @try {
         JTDiag(@"[TabBar设置] %@ setViewControllers: → %@",
                NSStringFromClass([self class]), JTDescribeVCArray(vcs));
@@ -711,11 +770,11 @@ static void JTSetVCsHook(id self, SEL _cmd, NSArray *vcs) {
         JTDiag(@"[TabBar设置] 调用栈:%@", s);
     } @catch (NSException *e) {
     }
-    IMP orig = JTOriginalIMPFor(self, gJTOrigSetVCsMap);
     if (orig) ((void (*)(id, SEL, NSArray *))orig)(self, _cmd, vcs);
 }
 
 static void JTSetVCsAnimatedHook(id self, SEL _cmd, NSArray *vcs, BOOL animated) {
+    IMP orig = gJTOrigSetVCsAnim;
     @try {
         JTDiag(@"[TabBar设置] %@ setViewControllers:animated: → %@",
                NSStringFromClass([self class]), JTDescribeVCArray(vcs));
@@ -725,25 +784,28 @@ static void JTSetVCsAnimatedHook(id self, SEL _cmd, NSArray *vcs, BOOL animated)
         JTDiag(@"[TabBar设置] 调用栈:%@", s);
     } @catch (NSException *e) {
     }
-    IMP orig = JTOriginalIMPFor(self, gJTOrigSetVCsAnimMap);
     if (orig) ((void (*)(id, SEL, NSArray *, BOOL))orig)(self, _cmd, vcs, animated);
 }
 
 static void JTInstallTabBarHooks(void) {
 #if ENABLE_TABBAR_FORENSICS
     @try {
-        if (!gJTOrigSetVCsMap) gJTOrigSetVCsMap = [NSMutableDictionary dictionary];
-        if (!gJTOrigSetVCsAnimMap) gJTOrigSetVCsAnimMap = [NSMutableDictionary dictionary];
         if (!gJTSelSetVCs) gJTSelSetVCs = NSSelectorFromString(@"setViewControllers:");
         if (!gJTSelSetVCsAnimated)
             gJTSelSetVCsAnimated = NSSelectorFromString(@"setViewControllers:animated:");
 
-        NSUInteger a = JTInstallHooksUnderRootClass("UITabBarController", gJTSelSetVCs,
-                                                    (IMP)JTSetVCsHook, gJTOrigSetVCsMap);
-        NSUInteger b = JTInstallHooksUnderRootClass("UITabBarController", gJTSelSetVCsAnimated,
-                                                    (IMP)JTSetVCsAnimatedHook, gJTOrigSetVCsAnimMap);
-        JTDiag(@"[TabBar钩子] setViewControllers: 挂 %lu 个，setViewControllers:animated: 挂 %lu 个",
-               (unsigned long)a, (unsigned long)b);
+        // 两个 selector 各自独立：各自一个 shim、各自一个原 IMP 全局。
+        // （曾经共用一个按类名索引的字典 → 后者覆盖前者 → 参数个数错位 + 互相递归。）
+        BOOL a = JTInstallSingleHook("UITabBarController", gJTSelSetVCs,
+                                     (IMP)JTSetVCsHook, &gJTOrigSetVCs);
+        BOOL b = JTInstallSingleHook("UITabBarController", gJTSelSetVCsAnimated,
+                                     (IMP)JTSetVCsAnimatedHook, &gJTOrigSetVCsAnim);
+        if (a) gJTHookedSetVCs = @"UITabBarController";
+        if (b) gJTHookedSetVCsAnim = @"UITabBarController";
+
+        JTDiag(@"[TabBar钩子] setViewControllers: %@ | setViewControllers:animated: %@",
+               a ? @"已挂 UITabBarController" : @"未挂（该类未自己实现，或已挂过）",
+               b ? @"已挂 UITabBarController" : @"未挂（该类未自己实现，或已挂过）");
     } @catch (NSException *e) {
         JTDiag(@"[TabBar钩子] 安装异常: %@", e.reason);
     }
@@ -805,6 +867,7 @@ static BOOL JTShouldCapturePresentStack(NSString *key) {
 
 static void JTPresentHook(id self, SEL _cmd, id vcToPresent, BOOL animated,
                           __unsafe_unretained id completion) {
+    IMP orig = gJTOrigPresent;
     @try {
         NSString *key = [NSString stringWithFormat:@"%@ → %@",
                          NSStringFromClass([self class]),
@@ -814,7 +877,6 @@ static void JTPresentHook(id self, SEL _cmd, id vcToPresent, BOOL animated,
         JTNotePresent(key, stack);
     } @catch (NSException *e) {
     }
-    IMP orig = JTOriginalIMPFor(self, gJTOrigPresentMap);
     if (orig) {
         // completion 参数用 __unsafe_unretained：ARC 不会去 retain/release 一个栈上的 block
         ((void (*)(id, SEL, id, BOOL, __unsafe_unretained id))orig)(self, _cmd, vcToPresent,
@@ -825,13 +887,13 @@ static void JTPresentHook(id self, SEL _cmd, id vcToPresent, BOOL animated,
 static void JTInstallPresentHooks(void) {
 #if ENABLE_POPUP_FORENSICS
     @try {
-        if (!gJTOrigPresentMap) gJTOrigPresentMap = [NSMutableDictionary dictionary];
         if (!gJTSelPresent)
             gJTSelPresent = NSSelectorFromString(@"presentViewController:animated:completion:");
-        NSUInteger n = JTInstallHooksUnderRootClass("UIViewController", gJTSelPresent,
-                                                    (IMP)JTPresentHook, gJTOrigPresentMap);
-        JTDiag(@"[弹窗钩子] presentViewController:animated:completion: 挂 %lu 个",
-               (unsigned long)n);
+        BOOL ok = JTInstallSingleHook("UIViewController", gJTSelPresent,
+                                      (IMP)JTPresentHook, &gJTOrigPresent);
+        if (ok) gJTHookedPresent = @"UIViewController";
+        JTDiag(@"[弹窗钩子] presentViewController:animated:completion: %@",
+               ok ? @"已挂 UIViewController" : @"未挂（该类未自己实现，或已挂过）");
     } @catch (NSException *e) {
         JTDiag(@"[弹窗钩子] 安装异常: %@", e.reason);
     }
@@ -1051,8 +1113,8 @@ static void JTNoteVC(UIViewController *vc) {
 }
 
 static void JTViewDidAppearHook(id self, SEL _cmd, BOOL animated) {
-    IMP orig = JTOriginalIMPFor(self, gJTOrigVDAMap);   // 先转发原实现，保证 App 行为完全不变
-    if (orig) ((void (*)(id, SEL, BOOL))orig)(self, _cmd, animated);
+    IMP orig = gJTOrigVDA;   // 唯一且正确的原 IMP；常量时间，不做父类链查找
+    if (orig) ((void (*)(id, SEL, BOOL))orig)(self, _cmd, animated);   // 先转发，App 行为完全不变
     @try {
         if ([self isKindOfClass:[UIViewController class]]) {
             JTNoteVC((UIViewController *)self);
@@ -1063,11 +1125,14 @@ static void JTViewDidAppearHook(id self, SEL _cmd, BOOL animated) {
 
 static void JTInstallViewDidAppearHooks(void) {
     @try {
-        if (!gJTOrigVDAMap) gJTOrigVDAMap = [NSMutableDictionary dictionary];
         if (!gJTSelVDA) gJTSelVDA = NSSelectorFromString(@"viewDidAppear:");
-        NSUInteger n = JTInstallHooksUnderRootClass("UIViewController", gJTSelVDA,
-                                                    (IMP)JTViewDidAppearHook, gJTOrigVDAMap);
-        JTDiag(@"[钩子] viewDidAppear: 挂载 %lu 个实现", (unsigned long)n);
+        // ★ 只挂 UIViewController 自己。**不要**挂子类 —— 见 JTInstallSingleHook 上面的注释，
+        //   那正是 2026-09-30 栈溢出闪退的原因（UIKit 的 [super viewDidAppear:] 会回到我们的 shim）。
+        BOOL ok = JTInstallSingleHook("UIViewController", gJTSelVDA,
+                                      (IMP)JTViewDidAppearHook, &gJTOrigVDA);
+        if (ok) gJTHookedVDA = @"UIViewController";
+        JTDiag(@"[钩子] viewDidAppear: %@",
+               ok ? @"已挂 UIViewController" : @"未挂（该类未自己实现，或已挂过）");
     } @catch (NSException *e) {
         JTDiag(@"[钩子] 安装异常: %@", e.reason);
     }
@@ -1282,6 +1347,11 @@ static void JTInstallAfterLaunch(void) {
 
     JTStageSet("安装完成");
     JTDiag(@"[启动] %s %s 已加载", JT_TAG, JT_VERSION);
+    // 一行总览：哪个钩子真的挂上了。挂载失败时这里是"无"，而各安装器自己的那行会说明原因 ——
+    // 两处对不上就说明有问题，不用去翻中间几十行日志。
+    JTDiag(@"[钩子总览] viewDidAppear=%@ | setViewControllers=%@ | setViewControllers:animated=%@ | present=%@",
+           gJTHookedVDA ?: @"无", gJTHookedSetVCs ?: @"无",
+           gJTHookedSetVCsAnim ?: @"无", gJTHookedPresent ?: @"无");
     JTDiag(@"[用法] 点圆点=抓当前页并复制；长按圆点=复制全部诊断");
 
     // 活过 20 秒才算"启动成功"，此时才清零计数

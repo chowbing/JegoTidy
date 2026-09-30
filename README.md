@@ -206,9 +206,11 @@ GitHub Desktop 左下角确认当前分支是 `main` 且已 Push。
 | 查类表用 `class_copyMethodList` 手走父类链，**绝不用** `class_getInstanceMethod` | 后者会强制 `+initialize`；dyld 阶段全进程扫类 = 把 App 几百个类挨个初始化一遍，任一类的 `+initialize` 抛异常就死在启动前，且 `@try/@catch` 救不了（异常在 `dispatch_once` 里被 libdispatch 边界吞掉变成 `std::terminate`） |
 | 启动自愈计数（同构建连续 3 次启动异常 → 只留按钮不装钩子） | 防"崩到 App 完全打不开、连诊断都拿不到"。换构建 token 自动从 0 开始，修好即恢复 |
 | 诊断缓冲滚动窗口 + 显式截断标记 | 防"写满就静默停止"——那会保留头部丢掉尾部；标记是为了让"只有这些条目"和"只剩这些条目"可区分 |
-| 每个"自己实现该方法"的类单独挂 hook，原 IMP 按类名存 | 只挂基类对重写了该方法的子类是**瞎的**（`objc_msgSend` 落到子类实现上） |
-| **两个 `setViewControllers:` 重载各用独立字典** | 共用一个字典（键都是类名）会互相覆盖 → 转发到错误的 IMP → 参数对不上 + 对方也是我们的 hook → **无限递归** |
-| `WFIsDescendantOf` 廉价预筛 | 避免为全进程几万个类各做一次 `class_copyMethodList`，那会卡住启动一两秒 |
+| **一个 selector 只挂一个类**（原 IMP 是单个全局，不是字典） | **2026-09-30 栈溢出闪退的根因**。让一个共享 shim 服务多个类，转发就只能靠"从对象类沿父类链找第一份原 IMP"，而它**无法区分直接调用和 `[super]` 调用** → UIKit 的 `[super viewDidAppear:]` 又回到我们的 shim，查表又命中同一个类 → 无限递归爆栈。详见 `Tweak.xm` 里 `JTInstallSingleHook` 上方的完整崩溃栈 |
+| 安装器**幂等**（`method_getImplementation(own) == replacement` 就拒绝） | 二次安装时 `method_setImplementation` 返回的是**我们自己的 shim** → "原 IMP"变成自己 → 一调用就自递归 |
+| **两个 `setViewControllers:` 重载各用独立原 IMP** | 共用一个按类名索引的字典会互相覆盖 → 转发到错误的 IMP → 参数个数对不上 + 对方也是我们的 hook → 无限递归 |
+| 信号处理器注册 `sigaltstack` + `SA_ONSTACK` | 栈溢出（最常见的崩溃类型）时，处理器默认跑在**已经耗尽的那条栈**上，第一条指令就二次 SIGSEGV —— 于是 `wf_crash.log` 一个字节都写不出来。必须换独立栈，且 `signal()` 设不了 `SA_ONSTACK`，得用 `sigaction()` |
+| `JTIsDescendantOf` 廉价预筛 | 类名扫描时避免为全进程几万个类各做一次 `class_copyMethodList` |
 | 弹窗取调用栈前先查"是不是新键" | `callStackSymbols` 要符号化，不便宜；present 可能被系统高频调用 |
 | 类名扫描放后台队列 | 几万个类跑正则，放主线程会有可见卡顿；这些只读运行时查询天然线程安全 |
 | `UIWindow addSubview:` 用 `class_addMethod` 加**自己的**实现 | 直接 `method_setImplementation` 改的是从 UIView 继承来的那份，会波及全 App 每一个 UIView |
@@ -224,6 +226,14 @@ GitHub Desktop 左下角确认当前分支是 `main` 且已 Push。
   风险自负。不要分发改造后的 IPA。
 - **越狱检测**：无忧行可能带越狱/注入检测。首次运行如果闪退或弹警告，
   把现象告诉我 —— 崩溃报告会落在 `Caches/wf_crash.log`，下次启动自动读回诊断框。
+  （栈溢出一类崩溃现在也能写出来了，见第 6 节的 `sigaltstack` 一行；
+  子线程崩溃仍可能写不出，那种直接抓系统 `.ips`。）
+- **`viewDidAppear:` 的观测覆盖面**：只挂 `UIViewController` 自己。**子类自己重写且不调用
+  `super`** 的 VC 我们看不到。这是刻意的取舍 —— 换成"挂所有子类"就是 2026-09-30 那次
+  栈溢出闪退。Apple 明确要求 `viewDidAppear:` 调用 `super`，绝大多数实现都会调。
+  漏掉的概率远小于"App 完全打不开"的代价。
+- **崩溃定位的两条信息源分工**：`wf_crash.log` 独有的信息是**阶段标记**（崩在哪一步）；
+  完整帧链以系统 `.ips` 为准（设置 → 隐私与安全性 → 分析与改进 → 分析数据）。
 - **不碰网络层**：v0.3 只做视图层和导航层，不 hook 任何请求/签名/鉴权逻辑。
 - **H5 页面**：如果某页实际是 `WKWebView` 渲染的，原生视图树里只有一个 webview，
   隐藏要靠注入 CSS（v0.4）。探针 dump 会明确显示是不是这种情况。
