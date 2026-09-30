@@ -1924,7 +1924,10 @@ static void JTSweepBlockAds(NSString *reason) {
 }
 
 static void JTStartAdSweepTimer(void) {
-#if ENABLE_AD_SWEEP
+    // ★ 注意这里的条件：定时器同时服务 tab 规则和广告扫掠两件事，
+    //   所以只要**任一**开着就必须起 —— 挂在 ENABLE_AD_SWEEP 下面会让
+    //   "关掉广告扫掠" 顺带把 tab 规则的漂移保护也一起关掉（一个很难注意到的耦合）。
+#if (ENABLE_AD_SWEEP || ENABLE_TAB_RULE)
     if (gJTSweepTimer) return;
     // 用 dispatch_source 而不是 NSTimer：NSTimer 受 runloop mode 影响 ——
     // 滚动 UITableView 时默认 mode 不跑定时器，滑动期间广告会短暂露出来；
@@ -1932,7 +1935,7 @@ static void JTStartAdSweepTimer(void) {
     dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                                  dispatch_get_main_queue());
     if (!t) {
-        JTDiag(@"[广告清理] 定时器创建失败 —— 本次只有启动那一次扫掠");
+        JTDiag(@"[维护] 定时器创建失败 —— 本次只有启动那一次处理");
         return;
     }
     uint64_t interval = (uint64_t)(SWEEP_INTERVAL_SEC * (double)NSEC_PER_SEC);
@@ -1940,16 +1943,20 @@ static void JTStartAdSweepTimer(void) {
     dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, (int64_t)interval),
                               interval, leeway);
     // ★ 这个定时器同时兜两件事，因为两者的"被 App 撤销"方式是同一个：
-    //   ① 广告扫掠（App 可能把广告重新显示出来）
-    //   ② tab 规则里的**自绘图标层**（App 可能在旋转 / 服务端配置刷新时自己重排，
+    //   ① tab 规则里的**自绘图标层**（App 可能在旋转 / 服务端配置刷新时自己重排，
     //      把我们已经摆好的图标挪回 5 槽位 —— 那时图标还是可见的，只是位置错乱，
     //      而启动复检链 +30s 就结束了，光靠它兜不住）
+    //   ② 广告扫掠（App 可能把广告重新显示出来）
     //   两个函数都幂等：状态对了就什么都不做，所以每秒调一次在正常情况下是零成本。
     dispatch_source_set_event_handler(t, ^{
         UIApplication *app = [UIApplication sharedApplication];
         if (!app || app.applicationState != UIApplicationStateActive) return;
+#if ENABLE_TAB_RULE
         JTApplyTabRule(@"定时");
+#endif
+#if ENABLE_AD_SWEEP
         JTSweepBlockAds(@"定时");
+#endif
     });
     dispatch_resume(t);
     gJTSweepTimer = t;
