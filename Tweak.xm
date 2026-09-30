@@ -137,6 +137,7 @@ static NSString *JTDumpViewTree(UIView *root, NSUInteger maxDepth, NSUInteger ma
 static NSString *JTDumpCurrentScreen(void);
 static UIViewController *JTCurrentVC(void);
 
+static NSArray *JTChildrenOf(UIViewController *vc);
 static void JTCollectTabBars(UIViewController *vc, NSMutableArray *out, NSUInteger depth);
 static NSString *JTDescribeTabBar(UITabBarController *tbc);
 static NSString *JTDescribeAllTabBars(void);
@@ -561,12 +562,46 @@ static NSString *JTDumpCurrentScreen(void) {
 
 // ============================== 6. TabBar 取证（本次任务的核心） ==============================
 
+// 取一个 VC 的子 VC 列表。
+//
+// ★ 为什么不用 `vc.children`（2026-09-30 CI 实测）：
+//   CI 上用的是 Xcode 26.6 的 iPhoneOS26.5 SDK，该 SDK 下 `children` 属性**没有暴露出来**，
+//   clang 直接报：
+//       Tweak.xm:569:36: error: property 'children' not found on object of type 'UIViewController *'
+//   这是**硬 error**，`-Wno-error` 救不了 —— 因为它是"类型系统不认这个成员"，
+//   不是"warning 被提升为 error"。本机没有 macOS，一次误判就是一轮 CI。
+//
+//   所以这里改走 KVC：只依赖 NSObject 的 `valueForKey:`，**编译期不依赖任何头文件声明**，
+//   换哪个 SDK 都不会再挂。运行时 UIKit 确实有 children 这个属性，正常能取到；
+//   万一取不到（异常或类型不符）就退回 childViewControllers（iOS 17 起标废弃，运行时仍在），
+//   再取不到就返回 nil，让上层跳过这棵子树 —— 取证少一层，好过构建挂掉。
+//
+//   通用教训：**凡是"我不确定某个 SDK 头文件到底声明了没"的成员，一律走运行时取值。**
+static NSArray *JTChildrenOf(UIViewController *vc) {
+    if (!vc) return nil;
+    @try {
+        id v = [vc valueForKey:@"children"];
+        if ([v isKindOfClass:[NSArray class]]) return (NSArray *)v;
+    } @catch (NSException *ignored) {
+    }
+    @try {
+        id v = [vc valueForKey:@"childViewControllers"];
+        if ([v isKindOfClass:[NSArray class]]) return (NSArray *)v;
+    } @catch (NSException *ignored) {
+    }
+    return nil;
+}
+
 static void JTCollectTabBars(UIViewController *vc, NSMutableArray *out, NSUInteger depth) {
     if (!vc || !out || depth > 10) return;
     if ([vc isKindOfClass:[UITabBarController class]] && ![out containsObject:vc]) {
         [out addObject:vc];
     }
-    for (UIViewController *c in vc.children) JTCollectTabBars(c, out, depth + 1);
+    for (id c in JTChildrenOf(vc)) {
+        if ([c isKindOfClass:[UIViewController class]]) {
+            JTCollectTabBars((UIViewController *)c, out, depth + 1);
+        }
+    }
     JTCollectTabBars(vc.presentedViewController, out, depth + 1);
 }
 

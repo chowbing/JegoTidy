@@ -82,8 +82,33 @@ GitHub Actions 自动构建 → 下载 artifact：JegoTidy-dylib、build.log
 之后每次改完：GitHub Desktop 里写 commit message → **Commit to main** → **Push origin**。
 `.gitignore` 已经把 `.theos/`、`*.dylib`、`build.log` 排除掉，构建产物不会进仓库。
 
-构建失败先看 `build.log`，`grep "error:"`。
-clang 遇到第一个硬错误就停，**报一个错不代表只有一个错** —— 修完要重跑 preflight。
+> ⚠️ **「添加本地仓库」和「新建仓库」不要选错（本项目已踩过两次）**
+>
+> GitHub Desktop 的 **File** 菜单里这两个挨在一起：
+>
+> - ✅ **Add local repository…（添加本地仓库）** ← 用这个。路径填
+>   `D:\WorkBuddy AI\无忧行\JegoTidy`
+> - ❌ **New repository…（新建仓库）** ← 别用。如果 Local path 填了
+>   `...\无忧行\JegoTidy`、Name 又填 `JegoTidy`，它会在**里面再套一层**
+>   `...\JegoTidy\JegoTidy\`，把那个空仓库推上 GitHub。
+>   症状：仓库网页上只有 `.gitattributes` 和 `README.md` 两个文件，Actions 不跑。
+>
+> 判断方法：在项目目录执行 `git remote -v`，**必须**输出
+> `https://github.com/chowbing/JegoTidy.git`。没有输出 = 你打开的是那个空壳子仓库。
+>
+> 已经踩了怎么办：删掉多出来的同名子目录，然后在 GitHub Desktop 里
+> **Repository → Remove** 移除那条错误记录（**不要**勾 "Move to Trash"），
+> 再用 Add local repository 重新添加正确路径。
+
+构建失败先看 `build.log`，`grep -n "error:" build.log`。
+
+**看最后那句的计数**：clang 默认 `-ferror-limit=20`，遇到语义错误会继续往下编译，
+所以结尾是 `1 error generated.` 就说明**整个编译单元真的只有这一个错**，修一次就够，
+不用靠再跑一轮 CI 去发现下一个。
+（例外：`'xxx.h' file not found` 这类 fatal error 会当场中止，那种情况下"只有一个错"
+说明不了任何事。）
+
+改完源码先跑 `python tools/preflight.py`，四项全过再推。
 
 ### CI 没触发怎么排查（按这个顺序，从便宜到贵）
 
