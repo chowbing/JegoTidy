@@ -1,8 +1,8 @@
 Package: com.shawn.jegotidy
 Name: JegoTidy
-Version: 0.2
+Version: 0.3.4
 Architecture: iphoneos-arm64
-Description: 移除无忧行 App 的「首页/目的地/流量」三个 tab，并拦截开屏广告与启动弹窗（TrollStore/TrollFools 注入）
+Description: 精简无忧行 App 界面：移除「首页/目的地/流量」三个 tab、清掉页面内运营位/广告、拦截开屏与启动弹窗（TrollStore/TrollFools 注入）
 Maintainer: Shawn
 Author: NYWF
 Section: Tweaks

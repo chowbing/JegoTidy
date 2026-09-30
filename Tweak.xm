@@ -1,6 +1,6 @@
 // ============================================================================
 // Tweak.xm — 无忧行 (com.cmi.jegotrip) 界面精简 Tweak
-// v0.3.3 —— 目标 ① 确认达成（残留凸起也消失了）；dump 升级为"能直接指向广告位"
+// v0.3.4 —— 「我的」页 + 「电话/消息」页两处运营位一起清；隐藏之后把占的高度收掉
 // ============================================================================
 // 目标（已与 Shawn 确认）：
 //   1) 把「首页 / 目的地 / 流量」这三个 **tab 从导航栏移除**，App 直接落到剩下的 tab；
@@ -15,7 +15,7 @@
 // 使用方式（真机）：
 //   1) 打开 App。右上角两个小圆点（都可拖动）：
 //        · 蓝色 JT —— 点 = 抓当前页并复制（含「广告候选汇总」）；长按 = 复制全部诊断
-//        · 橙色 T  —— 点 = 手动再应用一次 tab 规则；长按 = **恢复原始 5 个 tab 并停手**
+//        · 橙色 T  —— 点 = 手动再应用一次 tab 规则；长按 = **恢复原始 5 个 tab + 恢复所有被隐藏的广告 + 停手**
 //   2) 正常用一遍：切切 tab、进各页面、把启动时看到的弹窗复现一次。
 //   3) **长按 JT** → 完整诊断写进剪贴板 → 粘贴回来。
 //
@@ -115,6 +115,28 @@
 //   4) 新增「广告候选汇总」：只挑"已知广告类 / 类名可疑 / 横幅形态图片视图"三类，
 //      带窗口坐标单独列一段。★ 它只**报告**，不隐藏 —— 关键词判定误报率高，
 //      直接拿它去藏视图，就是把"猜"写进了产品行为里。判定由人做，改由下一版做。
+//
+// ---------------------------------------------------------------------------
+// v0.3.4：两处运营位一起清；并且**隐藏之后把占的高度收掉**
+// ---------------------------------------------------------------------------
+// v0.3.3 的 dump 给出了两个目标（依据 = 真机截图 + 视图树，不是推断）：
+//   · 「我的」页底部：`TBMineBannerCell (14,785,403,155)`，
+//     内含 2 个 `TBMineBannerItemCell`（"邀新有礼" / "流量特惠"，各一个 178×100 的 UIImageView）
+//   · 「电话/消息」页中部：「境外出行买语音 五折优惠」横幅 —— 对应 `BannerCycleView` / `BannerCycleViewCell`
+//     （**这一条是推断**，证据强度与推导写在 `JTClassIsKnownAdView` 上面）
+//
+// 这一版做三件事：
+//   1) 把上面四个类名加进"已知广告位"白名单 → 隐藏。
+//   2) ★ **隐藏 ≠ 去掉**：`hidden=YES` 只是不画，布局里那一格还在。
+//      「我的」页那条在最后一格（留白在底部，尚可忍），
+//      「电话/消息」页那条在**页面中部**（通讯工具和「最近记录」之间），留白一眼就看得出来。
+//      所以新增第 12c-2 节的收起机制：按"侵入性从小到大"试四条路
+//      （自身约束 → 父视图约束 → contentView 约束 → delegate 的 size 钩子），
+//      第一条成功就停；全失败就**如实记「会留白」**，不假装成功。
+//      ★ 为什么把 size 钩子排在最后：它是唯一会真正触发重排的，但也是唯一需要**新增钩子**的 ——
+//        而"新增钩子"正是本项目翻过两次车的那类改动。前三条件能解决就不装。
+//   3) 长按橙色 **T** 现在会**同时**恢复 tab 和我们隐藏过的广告并停手。
+//      因为 `BannerCycleView` 是推断出来的，必须有现场后悔药 —— 不能只靠"改代码重装"。
 // ============================================================================
 
 #import <UIKit/UIKit.h>
@@ -137,7 +159,7 @@
 // ============================== 配置 ==============================
 
 #define JT_TAG              "JegoTidy"
-#define JT_VERSION          "0.3.3"
+#define JT_VERSION          "0.3.4"
 #define JT_BUNDLE_ID        "com.cmi.jegotrip"
 
 #define ENABLE_CRASH_LOG         1   // 崩溃取证
@@ -151,6 +173,13 @@
 #define ENABLE_TAB_RULE          1   // ① 移除「首页 / 目的地 / 流量」三个 tab
 #define ENABLE_AD_SWEEP          1   // ③ 定时扫掠视图树，隐藏已确认的广告位
 #define ENABLE_POPUP_BLOCK       1   // ② 收掉开屏广告 / 启动弹窗
+
+// v0.3.4：命中广告后**除了隐藏，还把占的高度收掉**。
+// 为什么需要：只 `hidden=YES` 会在原地留一块空白 ——
+// 「我的」页那条在最后一格（留白在底部，尚可忍），
+// 「电话/消息」页那条在**页面中部**（通讯工具和最近记录之间），留白一眼就看出来。
+// 收起机制见 JTCollapseAdSpace()：先试 Auto Layout 高度约束，再试 frame，全部失败就**如实记日志**。
+#define ENABLE_AD_COLLAPSE       1
 
 // 保留哪些 tab —— 按 `UITabBarItem.tag`。
 // 实测 tag 与 index 一一对应：1000=首页 1001=目的地 1002=流量 1003=电话·消息 1004=我的
@@ -253,6 +282,13 @@ static NSMutableSet<NSString *> *gJTAdLoggedHidden  = nil;  // 已隐藏过、�
 static NSMutableDictionary<NSString *, NSNumber *> *gJTSuspectCache = nil;  // 类名 → 可疑判定缓存
 static dispatch_source_t         gJTSweepTimer = NULL;
 
+// v0.3.4：后悔药。记录**我们亲手隐藏过的广告视图**，长按 T 时逐个恢复。
+// 用 NSHashTable（弱引用）：视图本来就在层级里，我们不该成为它的唯一持有者 ——
+// 强引用会让被 App 丢弃的 cell 无法释放（cell 复用 + 我们持有 = 内存只增不减）。
+static NSHashTable<UIView *>    *gJTHiddenAdViews = nil;
+static BOOL                      gJTAdRuleDisabled = NO;   // 长按 T 后本次启动内不再动广告
+static NSMutableSet<NSString *> *gJTAdCollapseLogged = nil; // 收起结果的日志去重（按类名）
+
 static NSString *gJTLastTabDesc = nil;
 
 // ============================== 前向声明 ==============================
@@ -354,9 +390,14 @@ static BOOL JTClassLooksLikeAdSuspect(NSString *cn);
 static NSString *JTWindowRectString(UIView *v);
 static NSString *JTAdCandidateSummary(UIView *root);
 static NSUInteger JTSweepBlockAdsInView(UIView *v, NSUInteger depth, NSUInteger *budget,
-                                        NSMutableArray *hiddenNew, NSMutableArray *suspect);
+                                        NSMutableArray *hiddenNew, NSMutableArray *suspect,
+                                        NSMutableArray *collapseLog);
 static void JTSweepBlockAds(NSString *reason);
 static void JTStartAdSweepTimer(void);
+// v0.3.4：收起占位 + 布局取证 + 后悔药
+static NSString *JTCollapseAdSpace(UIView *v);
+static NSString *JTDescribeLayoutForView(UIView *v);
+static void JTRestoreAds(void);
 
 // v0.3 ② 开屏 / 弹窗判定（第 7 节用到）
 static BOOL JTClassLooksLikeSplashOrPopup(NSString *cn);
@@ -707,12 +748,18 @@ static NSString *JTDescribeNode(UIView *v) {
     [s appendString:JTWindowRectString(v)];
 
     NSString *cn = NSStringFromClass([v class]);
-    if (JTClassIsKnownAdView(cn)) {
+    BOOL knownAd = JTClassIsKnownAdView(cn);
+    BOOL suspectAd = JTClassLooksLikeAdSuspect(cn);
+    if (knownAd) {
         [s appendString:@" ★★已知广告位"];
-    } else if (JTClassLooksLikeAdSuspect(cn)) {
+    } else if (suspectAd) {
         [s appendString:@" ★广告嫌疑"];
     }
     if (JTIsInsideWebView(v)) [s appendString:@" [H5]"];
+
+    // 广告相关节点才补布局取证 —— 它要遍历约束，对上千个普通节点都做没有必要。
+    // 这几个字段回答的是"这一格的高度是谁定的"，直接决定下一轮用哪条收起路径。
+    if (knownAd || suspectAd) [s appendString:JTDescribeLayoutForView(v)];
 
     NSString *aid = v.accessibilityIdentifier;
     if (aid.length) [s appendFormat:@" id=%@", aid];
@@ -2294,6 +2341,13 @@ static BOOL JTClassIsKnownAdView(NSString *cn) {
     static NSString * const kKnown[] = {
         @"TripOperatingAdCell",     // 首页运营位广告 cell（实测 430×259）
         @"JegoSuspendedADView",     // 悬浮广告（实测 73×73，右下角）
+        // ---- v0.3.4 新增（依据 = 2026-09-30 v0.3.3 真机 dump）----
+        @"TBMineBannerCell",        // 「我的」页底部运营位（实测 403×155，内含 2 个 TBMineBannerItemCell：
+                                    //   "邀新有礼" / "流量特惠"，各带一个 178×100 的 UIImageView）
+        @"TBMineBannerItemCell",    // 上者的两个子项。父 cell 隐藏后它们本来就不可见，
+                                    //   一并列入是为了"父 cell 换实现"时不至于漏掉
+        @"BannerCycleView",         // 「电话/消息」页「境外出行买语音」横幅（**推断**，见下）
+        @"BannerCycleViewCell",     // 上者的宿主 cell
     };
     for (unsigned i = 0; i < sizeof(kKnown) / sizeof(kKnown[0]); i++) {
         if ([cn isEqualToString:kKnown[i]]) return YES;
@@ -2301,8 +2355,345 @@ static BOOL JTClassIsKnownAdView(NSString *cn) {
     return NO;
 }
 
+// ★ 关于 `BannerCycleView` / `BannerCycleViewCell` 的**证据强度**（不要当成同等确定）：
+//
+// 前四个是**实测**：dump 的视图树里直接看到了 `TBMineBannerCell (14,785,403,155)`，
+// 它的内容就是"邀新有礼 / 流量特惠"两张图 —— 与截图对得上。
+//
+// 后两个是**推断**，依据有两条：
+//   ① `[广告清理·页面出现]` 这一行出现在**启动后第一次页面出现**时，而启动默认落到的
+//      是 tag 1003 = 电话/消息（`JT_DEFAULT_TAB_TAG`）→ 那一刻窗口里只有 CallViewController，
+//      所以 `BannerCycleView` / `BannerCycleViewCell` 就在**电话/消息页**上。
+//   ② v0.2 dump 里 `BannerCycleView` 出现在首页头部的 `TripHomeHeadView` 里
+//      → 它是 App 的**通用横幅轮播组件**，被多个页面复用。
+//   而「电话/消息」页上唯一的横幅就是截图里那条"境外出行买语音 五折优惠"。
+//
+// 推断 ≠ 实测。所以这一条**必须靠下一轮真机 dump 复核**：
+// 装完去「电话/消息」页点一下 JT，看 `BannerCycleView` 的 `win=` 坐标是不是正好落在
+// 通讯工具卡片和「最近记录」之间。若不是，就把它从白名单里去掉。
+// 后悔药：长按 T 会把我们隐藏过的广告**全部恢复**并停手，不用重装。
+
+// ============================== 12c-2. 收起占位（v0.3.4） ==============================
+//
+// **隐藏 ≠ 去掉。** `hidden=YES` 只是不画，布局里那一格还在 ——
+// 「电话/消息」页那条横幅在**页面中部**（通讯工具卡片和「最近记录」之间），
+// 只隐藏会在那儿留一块空白，一眼就看得出来。
+//
+// 收高度有四条路，按"侵入性从小到大"依次试，**第一条成功就停**：
+//   ① 视图自身有高度约束                → constant = 0
+//   ② 父视图上有约束定死它的高度        → constant = 0
+//   ③ cell 的 contentView 上有高度约束  → constant = 0
+//   ④ 它是 cell，且类名在广告白名单里    → 给**这个类**加一份
+//      `preferredLayoutAttributesFittingAttributes:` 覆写，让它把自己算成 0 高
+//      （自撑高 cell 走这条路；**只有这条会真正让下面的内容往上挪**）
+// 全部失败 → 如实记「会留白」，不假装成功。
+//
+// ★ 为什么 ④ 用「类名」认身份，而不是记 indexPath：
+//   indexPath 是**位置**。用位置认身份，列表顺序一变就会改到无辜的格子 ——
+//   这正是 Gotcha 25 的同一种错误（"用位置认身份，自己一改位置就自毁"）。
+//   类名稳定，而且我们本来就只认这几个类。**同一个坑不踩第二次。**
+//
+// ★ ④ 为什么用 class_addMethod 而不是 method_setImplementation：
+//   `TBMineBannerCell` **没有自己实现**这个方法，是从 `UICollectionViewCell` 继承来的；
+//   继承来的 Method 属于父类，method_setImplementation 一改就波及全 App 每一个 cell。
+//   所以用 class_addMethod 在**子类上新增一份**，只在子类生效；我们的实现内部直接调用
+//   父类那份原始 IMP（不走 [super]，避免消息派发绕回自己）。
+static IMP                       gJTBaseFittingIMP = NULL;
+static NSMutableSet<NSString *> *gJTFittingLogged = nil;
+
+static SEL JTFittingSel(void) {
+    return NSSelectorFromString(@"preferredLayoutAttributesFittingAttributes:");
+}
+
+// ④ 的实现。
+// ★ 日志按类去重：基础实现每次都按"内容的自然高度"回答，所以覆写生效后
+//   `s.height > 0.5` **每次布局都为真** —— 不去重就会每次布局刷一行，把诊断缓冲冲掉。
+static id JTPreferredFittingHook(id self, SEL _cmd, id attrs) {
+    id a = attrs;
+    if (gJTBaseFittingIMP) {
+        a = ((id (*)(id, SEL, id))gJTBaseFittingIMP)(self, _cmd, attrs);
+    }
+    @try {
+        if ([a isKindOfClass:[UICollectionViewLayoutAttributes class]]) {
+            CGSize s = [(UICollectionViewLayoutAttributes *)a size];
+            if (s.height > 0.5) {
+                UICollectionViewLayoutAttributes *copy =
+                    (UICollectionViewLayoutAttributes *)[a copy];
+                copy.size = CGSizeMake(s.width, 0.0);
+                @synchronized (@"JTFitLog") {
+                    if (!gJTFittingLogged) gJTFittingLogged = [NSMutableSet set];
+                    NSString *key = NSStringFromClass([self class]);
+                    if (![gJTFittingLogged containsObject:key] && gJTFittingLogged.count < 20) {
+                        [gJTFittingLogged addObject:key];
+                        JTDiag(@"[广告收起·自撑高] %@ 高度 %.0f → 0（宽 %.0f 保持）",
+                               key, (double)s.height, (double)s.width);
+                    }
+                }
+                return copy;
+            }
+        }
+    } @catch (NSException *ignored) {
+    }
+    return a;
+}
+
+// 取证用：这个类在这个方法上是"继承 / 自己实现 / 我们的覆写"
+static NSString *JTFittingOwnerDesc(Class c) {
+    if (!c) return @"(无)";
+    Method own = JTOwnMethod(c, JTFittingSel());
+    if (!own) return @"继承";
+    return (method_getImplementation(own) == (IMP)JTPreferredFittingHook) ? @"我们的覆写" : @"自己实现";
+}
+
+// 给广告 cell 类装上 ④ 的覆写。返回一句人话说明结果。
+static NSString *JTInstallFittingOverride(Class adCell) {
+#if ENABLE_AD_COLLAPSE
+    if (!adCell) return @"类不存在";
+    @try {
+        SEL sel = JTFittingSel();
+        Method base = JTSafeInstanceMethod([UICollectionViewCell class], sel);
+        if (!base) return @"UICollectionViewCell 上找不到该方法";
+
+        Method own = JTOwnMethod(adCell, sel);
+        if (own) {
+            if (method_getImplementation(own) == (IMP)JTPreferredFittingHook) return @"覆写已在";
+            // App 自己实现了 —— **不动它**。要动就得为每个类各存一份原 IMP，
+            // 而"一个 selector 挂多个类"正是 2026-09-30 栈溢出闪退的成因（第 3b 节）。
+            return @"该类自己实现了该方法，跳过（不动它）";
+        }
+        if (!gJTBaseFittingIMP) gJTBaseFittingIMP = method_getImplementation(base);
+
+        if (!class_addMethod(adCell, sel, (IMP)JTPreferredFittingHook,
+                             method_getTypeEncoding(base))) {
+            return @"class_addMethod 失败";
+        }
+        return @"已加自撑高覆写";
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"覆写异常: %@", e.reason];
+    }
+#else
+    return @"ENABLE_AD_COLLAPSE=0，跳过";
+#endif
+}
+
+// 在 list 里找"把 item 的高度定死"的约束，找到就把 constant 归零，返回原值；没找到返回 0。
+// 两个方向都查：约束里 item 可能是 firstItem，也可能是 secondItem。
+static CGFloat JTZeroHeightIn(NSArray<NSLayoutConstraint *> *list, id item) {
+    if (!list || !item) return 0.0;
+    for (NSLayoutConstraint *c in list) {
+        BOOL isHeight = (c.firstAttribute == NSLayoutAttributeHeight) ||
+                        (c.secondAttribute == NSLayoutAttributeHeight);
+        if (!isHeight) continue;
+        if (c.firstItem != item && c.secondItem != item) continue;
+        if (c.constant <= 0.5) continue;
+        CGFloat old = c.constant;
+        c.constant = 0.0;
+        return old;
+    }
+    return 0.0;
+}
+
+// 把"我们刚隐藏的广告"占的高度收掉。返回一句人话说明用了哪条路。
+static NSString *JTCollapseAdSpace(UIView *v) {
+#if ENABLE_AD_COLLAPSE
+    if (!v) return @"(空)";
+    @try {
+        BOOL isCell = [v isKindOfClass:[UICollectionViewCell class]] ||
+                      [v isKindOfClass:[UITableViewCell class]];
+        CGFloat old = 0.0;
+
+        old = JTZeroHeightIn(v.constraints, (id)v);
+        if (old > 0.0) return [NSString stringWithFormat:@"①自身高度约束→0（原 %.0f）", (double)old];
+
+        UIView *sup = v.superview;
+        if (sup) {
+            old = JTZeroHeightIn(sup.constraints, (id)v);
+            if (old > 0.0) return [NSString stringWithFormat:@"②父视图高度约束→0（原 %.0f）", (double)old];
+        }
+
+        if (isCell) {
+            id cvObj = [v valueForKey:@"contentView"];
+            if ([cvObj isKindOfClass:[UIView class]]) {
+                UIView *content = (UIView *)cvObj;
+                old = JTZeroHeightIn(content.constraints, (id)content);
+                if (old > 0.0) return [NSString stringWithFormat:@"③contentView 高度约束→0（原 %.0f）", (double)old];
+            }
+            // ④ 自撑高覆写。认身份用的是**类名**，不是 indexPath —— 见本节顶部说明。
+            //   注意：只有布局走自撑高（estimatedItemSize 非零）时才会被调用；
+            //   不是自撑高时这条路**不会报错也不会生效**，表现为"已加覆写但仍有留白"。
+            return [NSString stringWithFormat:@"④%@（仅自撑高布局生效）",
+                    JTInstallFittingOverride([v class])];
+        }
+
+        if (!v.translatesAutoresizingMaskIntoConstraints) {
+            CGRect f = v.frame;
+            if (f.size.height > 0.5) {
+                v.frame = CGRectMake(f.origin.x, f.origin.y, f.size.width, 0.0);
+                return [NSString stringWithFormat:@"frame 高度→0（原 %.0f，纯 frame 布局）", (double)f.size.height];
+            }
+        }
+        return @"无可用高度约束、也不是 frame 布局（未收起，会留白）";
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"收起异常: %@", e.reason];
+    }
+#else
+    return @"ENABLE_AD_COLLAPSE=0，跳过";
+#endif
+}
+
+// ---- 布局取证：给 dump 用，回答"这一格的高度是谁定的" ----
+//
+// 为什么需要它：上面四条路里，①②③ 的前提是"有约束"，④ 的前提是"布局走自撑高"。
+// 只看到"会留白"这几个字，下一轮还是不知道该往哪走；把约束、布局对象、delegate、
+// 以及④那条覆写到底挂上没有一起打出来，下一轮就能直接决定用哪条路。
+// **每条诊断都必须自带"下一步怎么做"。**
+static NSString *JTDescribeLayoutForView(UIView *v) {
+    if (!v) return @"";
+    @try {
+        NSMutableString *s = [NSMutableString string];
+        UIView *sup = v.superview;
+
+        NSUInteger own = 0;
+        for (NSLayoutConstraint *c in v.constraints) {
+            BOOL isH = (c.firstAttribute == NSLayoutAttributeHeight) ||
+                       (c.secondAttribute == NSLayoutAttributeHeight);
+            if (isH && (c.firstItem == (id)v || c.secondItem == (id)v)) own++;
+        }
+        [s appendFormat:@"\n     自身高度约束=%lu", (unsigned long)own];
+
+        NSUInteger supH = 0;
+        if (sup) {
+            for (NSLayoutConstraint *c in sup.constraints) {
+                BOOL isH = (c.firstAttribute == NSLayoutAttributeHeight) ||
+                           (c.secondAttribute == NSLayoutAttributeHeight);
+                if (isH && (c.firstItem == (id)v || c.secondItem == (id)v)) supH++;
+            }
+        }
+        [s appendFormat:@" 父视图里指向它的高度约束=%lu", (unsigned long)supH];
+
+        [s appendFormat:@" 约束布局=%@", v.translatesAutoresizingMaskIntoConstraints ? @"是" : @"否(frame)"];
+        [s appendFormat:@" 所在容器=%@", sup ? NSStringFromClass([sup class]) : @"(无)"];
+        if (sup) {
+            NSString *kind = @"其它";
+            if ([sup isKindOfClass:[UICollectionView class]]) kind = @"UICollectionView";
+            else if ([sup isKindOfClass:[UITableView class]]) kind = @"UITableView";
+            [s appendFormat:@" 容器类型=%@", kind];
+        }
+        // ④ 那条路的前提：这个类在 preferredLayoutAttributesFittingAttributes: 上是"继承"还是"自己实现"
+        [s appendFormat:@"\n     fitting方法=%@（继承=可加覆写）", JTFittingOwnerDesc([v class])];
+
+        BOOL isCell = [v isKindOfClass:[UICollectionViewCell class]] ||
+                      [v isKindOfClass:[UITableViewCell class]];
+        if (isCell) {
+            UIView *p = sup;
+            NSUInteger guard = 0;
+            UICollectionView *cv = nil;
+            while (p && guard++ < 16) {
+                if ([p isKindOfClass:[UICollectionView class]]) { cv = (UICollectionView *)p; break; }
+                p = p.superview;
+            }
+            if (cv) {
+                NSIndexPath *ip = [cv indexPathForCell:(UICollectionViewCell *)v];
+                [s appendFormat:@"\n     indexPath=%@", ip ? [NSString stringWithFormat:@"%ld-%ld", (long)ip.section, (long)ip.item] : @"(不在可见格)"];
+
+                id<UICollectionViewDelegate> d = cv.delegate;
+                [s appendFormat:@" 布局对象=%@", cv.collectionViewLayout ? NSStringFromClass([cv.collectionViewLayout class]) : @"(无)"];
+                [s appendFormat:@"\n     delegate=%@", d ? NSStringFromClass([d class]) : @"(无)"];
+                UICollectionViewFlowLayout *fl = nil;
+                if ([cv.collectionViewLayout isKindOfClass:[UICollectionViewFlowLayout class]]) {
+                    fl = (UICollectionViewFlowLayout *)cv.collectionViewLayout;
+                }
+                if (fl) {
+                    CGSize it = fl.itemSize, est = fl.estimatedItemSize;
+                    [s appendFormat:@" itemSize=(%.0f,%.0f) estimatedItemSize=(%.0f,%.0f) 自撑高=%@",
+                        (double)it.width, (double)it.height,
+                        (double)est.width, (double)est.height,
+                        (est.height > 0.5) ? @"是" : @"否"];
+                } else {
+                    [s appendString:@" (非 FlowLayout，④那条路大概率不适用)"];
+                }
+            }
+        }
+        return s;
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"\n     (布局取证异常: %@)", e.reason];
+    }
+}
+
+// ---- 自证：收起到底生效了没有 ----
+//
+// 为什么要这一步：`JTCollapseAdSpace` 返回的"④已加自撑高覆写"只是一句**声明** ——
+// 覆写加上了不等于它被调用过（不是自撑高布局就永远不会被调用）。
+// **声明不是证据。** 所以 1.5 秒后回看这个视图的实际高度：
+// 归零 = 生效；还有高度 = 没生效，下一版必须改走 delegate 的 size 钩子。
+// （1.5s 是为了让布局至少跑完一轮；期间强引用一下这个视图，1.5 秒的持有没有影响。）
+static void JTScheduleCollapseVerify(UIView *v, NSString *cn) {
+    if (!v || cn.length == 0) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try {
+            CGRect f = v.frame;
+            if (f.size.height > 0.5) {
+                JTDiag(@"[广告收起·自证] %@ 1.5s 后高度仍为 %.0f —— **收起未生效**，"
+                        "下一版改走 delegate 的 size 钩子（或核对布局是否自撑高）",
+                       cn, (double)f.size.height);
+            } else {
+                JTDiag(@"[广告收起·自证] %@ 1.5s 后高度已为 0，收起生效", cn);
+            }
+        } @catch (NSException *ignored) {
+        }
+    });
+}
+
+// ---- 后悔药：把我们隐藏过的广告全部恢复，并停手 ----
+// 和 tab 规则的"长按 T 恢复"是同一个思路：现场可撤销，不用重装不用重启。
+// 必须同时**停手** —— 复检链还在每秒跑，不停手的话下一次扫掠会立刻又把它藏回去，
+// 用户看到的是"按了没反应"。
+//
+// ★ 注意 ④ 那条"自撑高覆写"是**加在类上的**，没法按视图撤销。
+//   所以停手之外还得把它**中和掉**：把记录过的类上的覆写恢复成父类实现。
+//   做不到"删掉方法"，但可以把 IMP 换回父类那份 —— 效果一样（等价于没覆写过）。
+static void JTRestoreAds(void) {
+    @try {
+        gJTAdRuleDisabled = YES;
+        NSUInteger n = 0;
+        if (gJTHiddenAdViews) {
+            for (UIView *v in gJTHiddenAdViews.allObjects) {
+                v.hidden = NO;
+                n++;
+            }
+            [gJTHiddenAdViews removeAllObjects];
+        }
+
+        // 中和 ④：把广告 cell 类上的覆写换回父类实现
+        NSUInteger undone = 0;
+        if (gJTBaseFittingIMP) {
+            static NSString * const kAdCells[] = {
+                @"TBMineBannerCell", @"TBMineBannerItemCell",
+                @"BannerCycleViewCell", @"TripOperatingAdCell",
+            };
+            SEL sel = JTFittingSel();
+            for (unsigned i = 0; i < sizeof(kAdCells) / sizeof(kAdCells[0]); i++) {
+                Class c = objc_getClass(kAdCells[i].UTF8String);
+                if (!c) continue;
+                Method own = JTOwnMethod(c, sel);
+                if (!own) continue;
+                if (method_getImplementation(own) != (IMP)JTPreferredFittingHook) continue;
+                method_setImplementation(own, gJTBaseFittingIMP);
+                undone++;
+            }
+        }
+
+        JTDiag(@"[广告恢复·手动] 已恢复 %lu 个视图，撤销 %lu 个自撑高覆写；"
+                "本次启动内不再隐藏广告（重开 App 才恢复自动）",
+               (unsigned long)n, (unsigned long)undone);
+    } @catch (NSException *e) {
+    }
+}
+
 static NSUInteger JTSweepBlockAdsInView(UIView *v, NSUInteger depth, NSUInteger *budget,
-                                        NSMutableArray *hiddenNew, NSMutableArray *suspect) {
+                                        NSMutableArray *hiddenNew, NSMutableArray *suspect,
+                                        NSMutableArray *collapseLog) {
     if (!v || depth > (NSUInteger)SWEEP_MAX_DEPTH || !budget || *budget == 0) return 0;
     (*budget)--;
     NSUInteger acted = 0;
@@ -2312,6 +2703,24 @@ static NSUInteger JTSweepBlockAdsInView(UIView *v, NSUInteger depth, NSUInteger 
         if (!v.hidden) {
             v.hidden = YES;
             acted++;
+            if (!gJTHiddenAdViews) gJTHiddenAdViews = [NSHashTable weakObjectsHashTable];
+            [gJTHiddenAdViews addObject:v];
+
+            // 隐藏之后立刻收高度 —— 只隐藏会在页面中部留一块空白（见第 12c-2 节）
+            NSString *how = JTCollapseAdSpace(v);
+            BOOL firstForThis = NO;
+            @synchronized (@"JTAdLog") {
+                if (!gJTAdCollapseLogged) gJTAdCollapseLogged = [NSMutableSet set];
+                NSString *key = [NSString stringWithFormat:@"%@|%@", cn, how];
+                if (![gJTAdCollapseLogged containsObject:key] && gJTAdCollapseLogged.count < 40) {
+                    [gJTAdCollapseLogged addObject:key];
+                    [collapseLog addObject:[NSString stringWithFormat:@"%@ → %@", cn, how]];
+                    firstForThis = YES;
+                }
+            }
+            // 每个类只安排一次自证，避免每秒重复排
+            if (firstForThis) JTScheduleCollapseVerify(v, cn);
+
             // 日志只在"某个类第一次被隐藏"时打一次 —— 否则 App 一旦把广告重新显示出来，
             // 我们就每秒刷一行，把真正有用的信息挤出诊断缓冲。
             @synchronized (@"JTAdLog") {
@@ -2335,7 +2744,7 @@ static NSUInteger JTSweepBlockAdsInView(UIView *v, NSUInteger depth, NSUInteger 
 
     for (UIView *c in v.subviews) {
         if (*budget == 0) break;
-        acted += JTSweepBlockAdsInView(c, depth + 1, budget, hiddenNew, suspect);
+        acted += JTSweepBlockAdsInView(c, depth + 1, budget, hiddenNew, suspect, collapseLog);
     }
     return acted;
 }
@@ -2343,21 +2752,28 @@ static NSUInteger JTSweepBlockAdsInView(UIView *v, NSUInteger depth, NSUInteger 
 static void JTSweepBlockAds(NSString *reason) {
 #if ENABLE_AD_SWEEP
     @try {
+        if (gJTAdRuleDisabled) return;   // 长按 T 之后本次启动不再动广告
+
         UIApplication *app = [UIApplication sharedApplication];
         // 后台不扫：一是没必要，二是往非活跃界面写 hidden 没意义，还可能干扰 App 自己的状态恢复
         if (!app || app.applicationState != UIApplicationStateActive) return;
 
         NSMutableArray *hiddenNew = [NSMutableArray array];
         NSMutableArray *suspect = [NSMutableArray array];
+        NSMutableArray *collapseLog = [NSMutableArray array];
         NSUInteger acted = 0;
         for (UIWindow *w in app.windows) {
             if ([w isKindOfClass:[JTOverlayWindow class]]) continue;
             NSUInteger budget = SWEEP_NODE_BUDGET;
-            acted += JTSweepBlockAdsInView(w, 0, &budget, hiddenNew, suspect);
+            acted += JTSweepBlockAdsInView(w, 0, &budget, hiddenNew, suspect, collapseLog);
         }
         if (hiddenNew.count > 0) {
             JTDiag(@"[广告清理·%@] 隐藏 %lu 个（本次新命中类：%@）",
                    reason, (unsigned long)acted, [hiddenNew componentsJoinedByString:@", "]);
+        }
+        if (collapseLog.count > 0) {
+            JTDiag(@"[广告收起·%@] 收高度的结果：%@",
+                   reason, [collapseLog componentsJoinedByString:@" | "]);
         }
         if (suspect.count > 0) {
             JTDiag(@"[广告清理·%@] 可疑但**未处理**的类（下一轮据此补白名单）：%@",
@@ -2480,13 +2896,15 @@ static void JTStartAdSweepTimer(void) {
     }
 }
 
-// 长按 T = **恢复**原始 5 个 tab，并在本次启动内停手。
-// 这是 v0.3 的"后悔药"：规则一旦误判（比如「流量」其实不是我们以为的那个 index），
+// 长按 T = **恢复**：原始 5 个 tab 复原 + 我们隐藏过的广告全部恢复，并在本次启动内停手。
+// 这是"后悔药"：规则一旦误判（比如「流量」其实不是我们以为的那个 index，
+// 或者 `BannerCycleView` 其实不是「电话/消息」页那条横幅），
 // 不用重装、不用重启，长按一下就回到原样，同时把诊断写进剪贴板供排查。
 - (void)onTabsRestore:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
     @try {
         JTRestoreTabs();
+        JTRestoreAds();
         JTLogTabBarState(@"手动恢复");
         UIPasteboard.generalPasteboard.string = JTDiagSnapshot();
         [self flash:@"复原"];
@@ -2573,7 +2991,7 @@ static void JTInstallFloatButton(void) {
         gJTButton = b;
         gJTRmButton = rm;
         gJTBtnHandler = h;   // 必须持有：target-action 不 retain target
-        JTDiag(@"[悬浮按钮] 已安装（JT=抓取当前页/长按全量；T=手动应用 tab 规则/长按恢复）");
+        JTDiag(@"[悬浮按钮] 已安装（JT=抓取当前页/长按全量；T=手动应用 tab 规则/长按恢复 tab+广告）");
     } @catch (NSException *e) {
         JTDiag(@"[悬浮按钮] 安装异常: %@", e.reason);
     }
@@ -2649,7 +3067,7 @@ static void JTInstallAfterLaunch(void) {
            gJTHookedVDA ?: @"无", gJTHookedSetVCs ?: @"无",
            gJTHookedSetVCsAnim ?: @"无", gJTHookedPresent ?: @"无");
     JTDiag(@"[用法] JT: 点=抓当前页并复制 / 长按=复制全部诊断。"
-            "T: 点=手动应用 tab 规则 / 长按=恢复原始 tab 并停手。");
+            "T: 点=手动应用 tab 规则 / 长按=恢复原始 tab + 恢复被隐藏的广告 + 停手。");
 
     // 活过 20 秒才算"启动成功"，此时才清零计数
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)),
