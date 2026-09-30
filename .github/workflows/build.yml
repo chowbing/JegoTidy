@@ -1,9 +1,11 @@
 name: Build JegoTidy dylib
 
 on:
+  # 任何分支的 push 都触发。原来是 branches: [main, master]，
+  # 去掉分支过滤是为了排除"推到了别的分支名所以不触发"这一类原因。
   push:
-    branches: [ main, master ]
-  workflow_dispatch:   # 允许在 GitHub 网页手动触发（不 push 也能重跑）
+  # 也可以在网页手动触发：Actions → 左侧选 Build JegoTidy dylib → Run workflow
+  workflow_dispatch:
 
 jobs:
   build:

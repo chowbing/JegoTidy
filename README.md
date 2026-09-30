@@ -85,6 +85,42 @@ GitHub Actions 自动构建 → 下载 artifact：JegoTidy-dylib、build.log
 构建失败先看 `build.log`，`grep "error:"`。
 clang 遇到第一个硬错误就停，**报一个错不代表只有一个错** —— 修完要重跑 preflight。
 
+### CI 没触发怎么排查（按这个顺序，从便宜到贵）
+
+**1. 仓库里到底有没有那个文件**
+在 github.com 打开仓库 → 确认文件列表里有 `.github/workflows/build.yml`。
+看不到 = 推送没成功（回 GitHub Desktop 再点一次 **Push origin**）。
+
+**2. Actions 认不认得这个 workflow**
+仓库页 → **Actions** 标签 → 看左侧栏有没有 **Build JegoTidy dylib**？
+
+- **有** → 文件没问题，是触发条件或额度问题，看第 3、4 条
+- **没有**，或页面写着 *Workflows aren't being run on this repository* → Actions 被关了：
+  **Settings → Actions → General → Actions permissions** 选
+  *Allow all actions and reusable workflows* → Save
+
+**3. 手动触发一次**
+Actions → 左侧选 **Build JegoTidy dylib** → 右侧 **Run workflow** → 分支选 `main` → Run。
+能跑起来 = 文件没问题，只是自动触发没生效。
+
+**4. 额度（最容易被忽略的一条）**
+**Settings → Billing and plans → Plans and usage → Actions**
+
+个人免费账号的私有仓库每月 2,000 分钟，**但 macOS runner 按 10 倍计费** ——
+等于每月只有约 **200 分钟真实 macOS 构建时间**。
+额度用完的表现是：run 会创建但**立刻失败**，提示 spending limit。
+
+绕开的办法（按推荐顺序）：
+
+| 办法 | 代价 |
+|---|---|
+| 等下一个计费周期重置 | 最省事，但要等 |
+| 仓库改成 **public** | Actions 对公开仓库**免费且不限量**；代价是代码公开 |
+| `runs-on` 改 `ubuntu-latest` | 1 倍计费，但 Linux 交叉编译 iOS 的坑更多（见技能里的说明） |
+
+**5. 分支名**
+GitHub Desktop 左下角确认当前分支是 `main` 且已 Push。
+
 ---
 
 ## 4. v0.2 怎么用（真机操作）
