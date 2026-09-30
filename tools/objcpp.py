@@ -4,7 +4,7 @@
 抓不到"在 Objective-C 里合法、在 Objective-C++ 里是硬 error"的那一类。这类错每次都要烧掉
 一轮 CI（2026-09-24 就因此挂了一次）。
 
-目前覆盖四类已实际踩过的坑：
+目前覆盖五类已实际踩过的坑：
   A. 函数指针 ↔ void* 的隐式转换
      `[NSValue valueWithPointer:orig]` 其中 orig 是 IMP → C++ 不允许函数指针隐式转 const void*。
   B. `getResourceValue:&x` 这类 out id* 参数（ARC 下走 pass-by-writeback，ObjC++ 更容易踩）。
@@ -12,8 +12,15 @@
   D. `volatile const char *` 传进**有类型**的形参（如 `stringWithUTF8String:`）：
      丢掉 volatile 限定符在 C++ 里是 ill-formed。传进 `...` 可变参数（%s）反而没事 ——
      所以这个坑只在"有类型形参"处爆，很隐蔽。
+  E. **标量 → 对象指针**的强转，ARC 下是硬 error（2026-09-30 真机 CI 实测）：
+       Class c = (Class)(uintptr_t)key.unsignedLongLongValue;
+       error: cast of 'uintptr_t' (aka 'unsigned long') to 'Class' is disallowed with ARC
+     这一类几乎总是"为了把对象指针塞进 NSDictionary 而当键"折腾出来的。
+     正确做法是**别做这个往返** —— 用 C 结构体数组存（见 Tweak.xm 第 3c 节）。
+     ★ 这条是补写的：当时 preflight 四项全过，错误是 CI 才报出来的 ——
+       一个对已知坏样本说 OK 的检查器给的是虚假信心，所以必须连自证样本一起补。
 
-用法：python objcpp.py [Tweak.xm]    A/B/D 类有问题时退出码 1；C 类仅提示。
+用法：python objcpp.py [Tweak.xm]    A/B/D/E 类有问题时退出码 1；C 类仅提示。
 """
 import os
 import re
@@ -35,6 +42,20 @@ TYPED_CSTR_APIS = [
     'strlen', 'strcmp', 'strncmp', 'strcpy', 'strncpy', 'strdup', 'strstr',
     'fopen', 'open', 'stat', 'access', 'unlink',
 ]
+
+# E 类：C 标量类型名。出现在 `(对象指针类型)(标量类型)` 里就是 ARC 硬 error。
+SCALAR_TYPES = [
+    'uintptr_t', 'intptr_t', 'NSUInteger', 'NSInteger', 'size_t', 'ptrdiff_t',
+    'unsigned long long', 'unsigned long', 'long long', 'long',
+    'unsigned int', 'unsigned short', 'unsigned char', 'signed char',
+    'int', 'short', 'char', 'BOOL', 'CGFloat', 'float', 'double',
+]
+# E 类：对象指针类型（Class / id / Protocol / 任意 `Xxx *`）
+OBJ_PTR_TYPE = r'(?:Class|id|Protocol|(?:[A-Za-z_]\w*)\s*\*)'
+_RE_E_ARC_CAST = re.compile(
+    r'\(\s*' + OBJ_PTR_TYPE + r'\s*\)\s*\(\s*'
+    + r'(?:' + '|'.join(re.escape(t) for t in SCALAR_TYPES) + r')\s*\)'
+)
 
 
 def strip_noise(line):
@@ -94,10 +115,22 @@ def main():
                                      '改用 WFStageText() 这类收口函数，或显式 (const char *)%s'
                                      % (api, name)))
 
+        # E. 标量 → 对象指针 的强转（ARC 下是硬 error）
+        #    `(Class)(uintptr_t)x` / `(id)(NSUInteger)x` / `(SomeType *)(intptr_t)x`
+        #    → error: cast of 'uintptr_t' to 'Class' is disallowed with ARC
+        #    只认"操作数**本身就是一个标量类型名**"这一种精确形态，零误报。
+        #    （操作数是表达式的情形无法静态判定，宁可漏报也不误报 ——
+        #      一个会误报的 FAIL 级检查会训练人忽略它，比没有更差。）
+        m = _RE_E_ARC_CAST.search(code)
+        if m:
+            problems.append((i, 'E 标量→对象指针（ARC 禁止）', s,
+                             'ARC 不允许整数→对象指针强转。不要做这个往返：'
+                             '把 Class 存进 NSDictionary 就得这么转 → 改用 C 结构体数组存'
+                             '（见 Tweak.xm 第 3c 节 JTBaseIMPTable）'))
+
         # C. 三元里混 nil / Nil（仅提示）
         if re.search(r'\?[^?;]*:\s*(?:nil|Nil)\b', code):
             notes.append((i, 'C 三元混 nil', s))
-
     if problems:
         print("=== Objective-C++ 类型陷阱（Objective-C 下合法，ObjC++ 下是硬 error）===")
         for i, kind, s, fix in problems:

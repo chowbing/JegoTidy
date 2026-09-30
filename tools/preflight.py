@@ -64,10 +64,20 @@ static void f(void) {
     };
 }
 """
+# v4 新增：标量 → 对象指针 的强转（ARC 下硬 error）。
+# 2026-09-30 真机 CI 实测漏过这一条：preflight 四项全过，CI 才报
+#   error: cast of 'uintptr_t' to 'Class' is disallowed with ARC
+BAD_ARC_CAST = """\
+static Class f(void *p) {
+    Class c = (Class)(uintptr_t)p;
+    return c;
+}
+"""
 
 SELF_TESTS = [
     ("objcpp.py", BAD_OBJCPP, "A 函数指针→void*"),
     ("objcpp.py", BAD_VOLATILE, "D volatile 限定符被丢弃"),
+    ("objcpp.py", BAD_ARC_CAST, "E 标量→对象指针"),
     ("audit.py", BAD_AUDIT, "调用点早于定义"),
     ("audit.py", BAD_GLOBAL, "全局引用早于定义"),
     ("audit.py", BAD_RECUR_BLOCK, "递归 block 缺 __block"),

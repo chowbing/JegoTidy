@@ -639,22 +639,55 @@ static BOOL JTIsDescendantOf(Class c, Class root) {
 // 来自 `UICollectionViewCell`；若统一取 `[UIView layoutSubviews]` 的 IMP 转发，
 // 就绕过了 `UICollectionViewCell` 自己的布局逻辑，cell 会画错。
 //
-// 用法：安装时用 `JTSafeInstanceMethod(cls, sel)` 取父实现存进 dict（键 = 类指针），
+// 用法：安装时用 `JTSafeInstanceMethod(cls, sel)` 取父实现存进一张小表（键 = 类），
 // 覆写里调用本函数回查。`self` 的实际类可能比安装的类更深（App 有私有子类），
 // 所以从 `self` 的类往上找**第一个自己实现了 sel 的类**，那才是安装点。
 //
 // 与 `[super …]` 的区别：本函数用显式 IMP 调用，不经过消息派发，不可能绕回自己
 // （`objc_msgSendSuper` 需要知道安装点的类，而覆写里拿不到；这正是 2026-09-30
-// 栈溢出闪退的同一种失效模式）。首次解析后按 `self` 的类缓存，后续只是一次字典命中。
-static IMP JTBaseIMPForOwner(id self, SEL sel,
-                             NSMutableDictionary<NSNumber *, NSValue *> *dict, IMP ourHook) {
-    if (!dict) return NULL;
+// 栈溢出闪退的同一种失效模式）。首次解析后按 `self` 的类缓存，后续只是一次表扫描。
+//
+// ★★ 为什么用 **C 结构体数组**而不是 `NSMutableDictionary`（2026-09-30 CI 教训）：
+//   键是 `Class`，而 `Class` 是**对象指针**。想把它塞进字典就得
+//   `@((uintptr_t)cls)`，取出来又要 `(Class)key.unsignedLongLongValue` ——
+//   而后者是 **ARC 明令禁止的"整数 → 对象指针"强转**，直接编译失败：
+//       error: cast of 'uintptr_t' to 'Class' is disallowed with ARC
+//   表项本来就 ≤ 8 个，用定长数组既不需要任何强转，也没有每轮布局的字典分配。
+//   （`__unsafe_unretained Class` 在 C 结构体里是合法的 —— 类对象永不释放。）
+#define JT_BASE_TABLE_CAP 16
+
+typedef struct {
+    __unsafe_unretained Class cls;    // 缓存键 = self 的**实际**类
+    IMP                      base;    // 该类对应的父实现
+} JTBaseIMPEntry;
+
+typedef struct {
+    JTBaseIMPEntry items[JT_BASE_TABLE_CAP];
+    NSUInteger     count;
+} JTBaseIMPTable;
+
+static void JTBaseIMPTableReset(JTBaseIMPTable *t) {
+    if (!t) return;
+    t->count = 0;
+    for (NSUInteger i = 0; i < JT_BASE_TABLE_CAP; i++) {
+        t->items[i].cls  = Nil;
+        t->items[i].base = NULL;
+    }
+}
+
+static IMP JTBaseIMPForOwner(id self, SEL sel, JTBaseIMPTable *table, IMP ourHook) {
+    if (!table) return NULL;
     Class c = object_getClass(self);
     if (!c) return NULL;
-    NSNumber *key = @((uintptr_t)c);
-    NSValue *hit = dict[key];
-    if (hit) return (IMP)hit.pointerValue;
 
+    // 1) 查缓存：从 self 的类往上，第一个出现在表里的就是安装点
+    for (Class k = c; k; k = class_getSuperclass(k)) {
+        for (NSUInteger i = 0; i < table->count; i++) {
+            if (table->items[i].cls == k) return table->items[i].base;
+        }
+    }
+
+    // 2) 未命中：解析安装点 —— 从 self 的类往上，第一个"自己实现了 sel"的类
     Class owner = Nil;
     for (Class k = c; k; k = class_getSuperclass(k)) {
         Method m = JTOwnMethod(k, sel);
@@ -668,8 +701,46 @@ static IMP JTBaseIMPForOwner(id self, SEL sel,
     if (!b) return NULL;
     IMP base = method_getImplementation(b);
     // 只在解析成功时缓存 —— 负缓存会让后续永远失败。
-    if (base) dict[key] = [NSValue valueWithPointer:(const void *)base];
+    if (base && table->count < JT_BASE_TABLE_CAP) {
+        table->items[table->count].cls  = c;
+        table->items[table->count].base = base;
+        table->count++;
+    }
     return base;
+}
+
+// 记一条"类 → 父实现"。同类的已有条目会被**更新**（撤销后又重装的情形）。
+// 表满返回 NO —— 宁可记不上、如实报错，也不覆盖别人的条目。
+static BOOL JTBaseIMPTablePut(JTBaseIMPTable *t, Class c, IMP base) {
+    if (!t || !c || !base) return NO;
+    for (NSUInteger i = 0; i < t->count; i++) {
+        if (t->items[i].cls == c) { t->items[i].base = base; return YES; }
+    }
+    if (t->count >= JT_BASE_TABLE_CAP) return NO;
+    t->items[t->count].cls  = c;
+    t->items[t->count].base = base;
+    t->count++;
+    return YES;
+}
+
+// 按类取回父实现；没有返回 NULL。
+static IMP JTBaseIMPTableGet(const JTBaseIMPTable *t, Class c) {
+    if (!t || !c) return NULL;
+    for (NSUInteger i = 0; i < t->count; i++) {
+        if (t->items[i].cls == c) return t->items[i].base;
+    }
+    return NULL;
+}
+
+// 按类删掉一条（尾部元素填补，保持数组紧凑）。
+static void JTBaseIMPTableRemove(JTBaseIMPTable *t, Class c) {
+    if (!t || !c) return;
+    for (NSUInteger i = 0; i < t->count; i++) {
+        if (t->items[i].cls != c) continue;
+        t->items[i] = t->items[t->count - 1];
+        t->count--;
+        return;
+    }
 }
 
 // ============================== 3b. hook 安装器 ==============================
@@ -2477,8 +2548,8 @@ static BOOL JTClassIsKnownAdView(NSString *cn) {
 //   所以用 class_addMethod 在**子类上新增一份**，只在子类生效；我们的实现内部直接调用
 //   父类那份原始 IMP（不走 [super]，避免消息派发绕回自己）。
 //
-// ★ 父实现**按类各存一份**（键 = 类指针），见第 3c 节的说明。
-static NSMutableDictionary<NSNumber *, NSValue *> *gJTFittingBase = nil;
+// ★ 父实现**按类各存一份**（见第 3c 节的 `JTBaseIMPTable`），不用全局单份。
+static JTBaseIMPTable gJTFittingBaseTable;                 // ④：类 → 父 preferredLayoutAttributesFittingAttributes:
 static NSMutableSet<NSString *> *gJTFittingLogged = nil;
 
 static SEL JTFittingSel(void) {
@@ -2490,7 +2561,7 @@ static SEL JTFittingSel(void) {
 //   `s.height > 0.5` **每次布局都为真** —— 不去重就会每次布局刷一行，把诊断缓冲冲掉。
 static id JTPreferredFittingHook(id self, SEL _cmd, id attrs) {
     id a = attrs;
-    IMP base = JTBaseIMPForOwner(self, _cmd, gJTFittingBase, (IMP)JTPreferredFittingHook);
+    IMP base = JTBaseIMPForOwner(self, _cmd, &gJTFittingBaseTable, (IMP)JTPreferredFittingHook);
     if (base) {
         a = ((id (*)(id, SEL, id))base)(self, _cmd, attrs);
     }
@@ -2544,13 +2615,13 @@ static NSString *JTInstallFittingOverride(Class adCell) {
             // 而"一个 selector 挂多个类"正是 2026-09-30 栈溢出闪退的成因（第 3b 节）。
             return @"该类自己实现了该方法，跳过（不动它）";
         }
-        if (!gJTFittingBase) gJTFittingBase = [NSMutableDictionary dictionary];
-        NSNumber *key = @((uintptr_t)adCell);
-        gJTFittingBase[key] = [NSValue valueWithPointer:(const void *)method_getImplementation(base)];
+        if (!JTBaseIMPTablePut(&gJTFittingBaseTable, adCell, method_getImplementation(base))) {
+            return @"父实现表已满，跳过";
+        }
 
         if (!class_addMethod(adCell, sel, (IMP)JTPreferredFittingHook,
                              method_getTypeEncoding(base))) {
-            [gJTFittingBase removeObjectForKey:key];
+            JTBaseIMPTableRemove(&gJTFittingBaseTable, adCell);
             return @"class_addMethod 失败";
         }
         return @"已加自撑高覆写";
@@ -2790,19 +2861,21 @@ static void JTRestoreAds(void) {
 
         // 中和 ④：把广告 cell 类上的自撑高覆写换回**各自的**父类实现
         NSUInteger undone = 0;
-        if (gJTFittingBase.count > 0) {
+        if (gJTFittingBaseTable.count > 0) {
             SEL sel = JTFittingSel();
-            NSArray<NSNumber *> *keys = gJTFittingBase.allKeys;
-            for (NSNumber *key in keys) {
-                Class c = (Class)(uintptr_t)key.unsignedLongLongValue;
-                if (!c) continue;
+            // 表在循环里**不动**，循环结束才 Reset —— 所以可以直接按下标遍历，
+            // 不需要"先拷出类名再按名字回查"那一圈（那还会多一次 NSStringFromClass 分配）。
+            for (NSUInteger i = 0; i < gJTFittingBaseTable.count; i++) {
+                Class c = gJTFittingBaseTable.items[i].cls;
+                IMP base = gJTFittingBaseTable.items[i].base;
+                if (!c || !base) continue;
                 Method own = JTOwnMethod(c, sel);
                 if (!own) continue;
                 if (method_getImplementation(own) != (IMP)JTPreferredFittingHook) continue;
-                method_setImplementation(own, (IMP)gJTFittingBase[key].pointerValue);
+                method_setImplementation(own, base);
                 undone++;
             }
-            [gJTFittingBase removeAllObjects];
+            JTBaseIMPTableReset(&gJTFittingBaseTable);
             [gJTFittingLogged removeAllObjects];
         }
 
@@ -2841,17 +2914,17 @@ static void JTRestoreAds(void) {
 //    **来自 `UICollectionViewCell` 而不是 `UIView`**。如果统一取 `[UIView layoutSubviews]`
 //    的 IMP 去转发，就会**绕过 UICollectionViewCell 自己的布局逻辑** —— cell 会画错。
 //    所以：安装时用 `JTSafeInstanceMethod(c, sel)`（沿 c 的父类链取"真正会被调用的那份"），
-//    存进以**类指针**为键的字典；调用时按 `self` 的实际类回查（复用第 3c 节的通用回查）。
+//    存进以**类**为键的定长表；调用时按 `self` 的实际类回查（复用第 3c 节的通用回查）。
 //
 // ★ 停手开关必须在**覆写内部**检查：长按 T 之后 `gJTAdRuleDisabled = YES`，
 //   覆写立刻变成直通（否则"恢复"会被自己的覆写压回去 —— 用户看到的是"按了没反应"）。
 //   `JTRestoreAds` 也确实是**先**置位、**后**恢复，顺序不能反。
-static NSMutableDictionary<NSNumber *, NSValue *> *gJTStickyBaseLayout = nil;  // 类指针 → 父 layoutSubviews IMP
-static NSMutableDictionary<NSNumber *, NSValue *> *gJTStickyBaseHidden = nil;  // 类指针 → 父 setHidden: IMP
+static JTBaseIMPTable gJTStickyLayoutTable;                // 类 → 父 layoutSubviews
+static JTBaseIMPTable gJTStickyHiddenTable;                // 类 → 父 setHidden:
 static NSMutableSet<NSString *> *gJTStickyDone = nil;      // 已尝试过粘性隐藏的类（日志去重）
 
 static void JTStickyLayoutSubviewsHook(id self, SEL _cmd) {
-    IMP base = JTBaseIMPForOwner(self, _cmd, gJTStickyBaseLayout, (IMP)JTStickyLayoutSubviewsHook);
+    IMP base = JTBaseIMPForOwner(self, _cmd, &gJTStickyLayoutTable, (IMP)JTStickyLayoutSubviewsHook);
     if (base) {
         ((void (*)(id, SEL))base)(self, _cmd);
     }
@@ -2865,7 +2938,7 @@ static void JTStickyLayoutSubviewsHook(id self, SEL _cmd) {
 static void JTStickySetHiddenHook(id self, SEL _cmd, BOOL hidden) {
     // App 设 NO 就压成 YES；设 YES 原样放行。停手时一律放行。
     if (!gJTAdRuleDisabled) hidden = YES;
-    IMP base = JTBaseIMPForOwner(self, _cmd, gJTStickyBaseHidden, (IMP)JTStickySetHiddenHook);
+    IMP base = JTBaseIMPForOwner(self, _cmd, &gJTStickyHiddenTable, (IMP)JTStickySetHiddenHook);
     if (base) {
         ((void (*)(id, SEL, BOOL))base)(self, _cmd, hidden);
     }
@@ -2877,9 +2950,6 @@ static NSString *JTInstallStickyHide(Class c) {
     if (!c) return @"类不存在";
     @try {
         NSMutableArray<NSString *> *parts = [NSMutableArray array];
-        NSNumber *key = @((uintptr_t)c);
-        if (!gJTStickyBaseLayout) gJTStickyBaseLayout = [NSMutableDictionary dictionary];
-        if (!gJTStickyBaseHidden) gJTStickyBaseHidden = [NSMutableDictionary dictionary];
 
         // ① layoutSubviews
         // ★ 父实现取自 `c` 自己的父类链（`JTSafeInstanceMethod(c, …)`），不是 `[UIView class]`。
@@ -2893,10 +2963,14 @@ static NSString *JTInstallStickyHide(Class c) {
             [parts addObject:(method_getImplementation(o1) == (IMP)JTStickyLayoutSubviewsHook)
                                 ? @"layoutSubviews:已在" : @"layoutSubviews:App 自己实现，跳过"];
         } else {
-            gJTStickyBaseLayout[key] = [NSValue valueWithPointer:(const void *)method_getImplementation(b1)];
-            BOOL ok = class_addMethod(c, s1, (IMP)JTStickyLayoutSubviewsHook, method_getTypeEncoding(b1));
-            if (!ok) [gJTStickyBaseLayout removeObjectForKey:key];
-            [parts addObject:ok ? @"layoutSubviews:已加" : @"layoutSubviews:addMethod 失败"];
+            if (!JTBaseIMPTablePut(&gJTStickyLayoutTable, c, method_getImplementation(b1))) {
+                [parts addObject:@"layoutSubviews:父实现表已满，跳过"];
+            } else {
+                BOOL ok = class_addMethod(c, s1, (IMP)JTStickyLayoutSubviewsHook,
+                                          method_getTypeEncoding(b1));
+                if (!ok) JTBaseIMPTableRemove(&gJTStickyLayoutTable, c);
+                [parts addObject:ok ? @"layoutSubviews:已加" : @"layoutSubviews:addMethod 失败"];
+            }
         }
 
         // ② setHidden:
@@ -2909,10 +2983,14 @@ static NSString *JTInstallStickyHide(Class c) {
             [parts addObject:(method_getImplementation(o2) == (IMP)JTStickySetHiddenHook)
                                 ? @"setHidden:已在" : @"setHidden:App 自己实现，跳过"];
         } else {
-            gJTStickyBaseHidden[key] = [NSValue valueWithPointer:(const void *)method_getImplementation(b2)];
-            BOOL ok = class_addMethod(c, s2, (IMP)JTStickySetHiddenHook, method_getTypeEncoding(b2));
-            if (!ok) [gJTStickyBaseHidden removeObjectForKey:key];
-            [parts addObject:ok ? @"setHidden:已加" : @"setHidden:addMethod 失败"];
+            if (!JTBaseIMPTablePut(&gJTStickyHiddenTable, c, method_getImplementation(b2))) {
+                [parts addObject:@"setHidden:父实现表已满，跳过"];
+            } else {
+                BOOL ok = class_addMethod(c, s2, (IMP)JTStickySetHiddenHook,
+                                          method_getTypeEncoding(b2));
+                if (!ok) JTBaseIMPTableRemove(&gJTStickyHiddenTable, c);
+                [parts addObject:ok ? @"setHidden:已加" : @"setHidden:addMethod 失败"];
+            }
         }
 
         return [parts componentsJoinedByString:@" | "];
@@ -2926,9 +3004,8 @@ static NSString *JTInstallStickyHide(Class c) {
 
 // 撤销粘性隐藏：把两个覆写换回**各自的**父类实现。
 // （不删方法 —— 运行时不支持；换回父类 IMP 与"没覆写过"等价。）
-// ★ 换回去之后还要把缓存的 base IMP 清掉：留着的话，万一之后又重新安装，
-//   `JTBaseIMPForOwner` 会命中"已经指向父实现"的旧缓存 —— 值本身仍然正确，
-//   但为了不留下"看起来装过、实际没装"的错觉，统一清空。
+// ★ 换回去之后还要把缓存的父实现表清掉、并把"已装类名"集合清空 ——
+//   否则之后重新安装会被静默跳过（`gJTStickyDone` 里已经有这个类名了）。
 static NSUInteger JTRemoveStickyHide(void) {
     NSUInteger undone = 0;
     @try {
@@ -2939,23 +3016,22 @@ static NSUInteger JTRemoveStickyHide(void) {
         for (NSString *n in names) {
             Class c = objc_getClass(n.UTF8String);
             if (!c) continue;
-            NSNumber *key = @((uintptr_t)c);
 
             Method m1 = JTOwnMethod(c, s1);
-            NSValue *b1 = gJTStickyBaseLayout[key];
+            IMP b1 = JTBaseIMPTableGet(&gJTStickyLayoutTable, c);
             if (m1 && b1 && method_getImplementation(m1) == (IMP)JTStickyLayoutSubviewsHook) {
-                method_setImplementation(m1, (IMP)b1.pointerValue);
+                method_setImplementation(m1, b1);
                 undone++;
             }
             Method m2 = JTOwnMethod(c, s2);
-            NSValue *b2 = gJTStickyBaseHidden[key];
+            IMP b2 = JTBaseIMPTableGet(&gJTStickyHiddenTable, c);
             if (m2 && b2 && method_getImplementation(m2) == (IMP)JTStickySetHiddenHook) {
-                method_setImplementation(m2, (IMP)b2.pointerValue);
+                method_setImplementation(m2, b2);
                 undone++;
             }
         }
-        [gJTStickyBaseLayout removeAllObjects];
-        [gJTStickyBaseHidden removeAllObjects];
+        JTBaseIMPTableReset(&gJTStickyLayoutTable);
+        JTBaseIMPTableReset(&gJTStickyHiddenTable);
         [gJTStickyDone removeAllObjects];   // 恢复之后允许重新安装
     } @catch (NSException *e) {
     }

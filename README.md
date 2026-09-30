@@ -211,12 +211,21 @@ C:/Users/1107089/.workbuddy-ai/binaries/python/versions/3.13.12/python.exe tools
 | `chk.py` | 括号/引号不配对（tokenizer 感知，字符串里的 `}` 不会骗过它） |
 | `audit.py` | A 调用点早于定义 · B 全局变量引用早于定义 · C 递归 block 缺 `__block` |
 | `strchk.py` | 字符串字面量未闭合 |
-| `objcpp.py` | ObjC++ 专属硬错误（`IMP` → `void *` 等） |
+| `objcpp.py` | ObjC++ / ARC 专属硬错误：A 函数指针→`void *` · B out `id *` 参数 · C 三元混 `nil`（仅提示） · D `volatile` 被丢弃 · **E 标量→对象指针强转（ARC 禁止）** |
 | `ips.py` | 崩溃报告解析（`python tools/ips.py crash.ips`） |
 
 **为什么必须跑**：`.xm` 被 clang 当 **Objective-C++** 编译，隐式函数声明、类型不匹配、
 `IMP` 隐式转 `void *` 全是**硬 error**，`-Wno-error` 救不了。本机编译不了，
 一次推送 = 一轮 Actions，所以本地先把这类错误清掉。
+
+> ★★ **检查器本身也要自证。** `preflight.py` 第 0 步会拿一份**故意写坏**的样本喂给每个检查器，
+> **必须报错才算通过**，然后再跑真文件。理由：一个对坏文件也说 OK 的检查器比没有更糟 ——
+> 它给的是**虚假信心**。
+>
+> 规则 E 就是这么补上的：2026-09-30 v1.0 推送时 preflight **四项全过**，
+> 但 CI 报了 `error: cast of 'uintptr_t' to 'Class' is disallowed with ARC`
+> —— 说明检查器有盲区。补规则的同时必须**补一份对应的坏样本**，
+> 否则下次还是漏。**每加一条规则，就加一条自证样本。**
 
 ---
 
@@ -224,7 +233,7 @@ C:/Users/1107089/.workbuddy-ai/binaries/python/versions/3.13.12/python.exe tools
 
 ```
 改 Tweak.xm
-   ↓  tools/preflight.py 四项全过
+   ↓  tools/preflight.py 四项全过（含第 0 步的"检查器自证"）
 GitHub Desktop → Commit to main → Push origin
    ↓
 GitHub Actions 自动构建 → 下载 artifact：JegoTidy-dylib、build.log
@@ -233,6 +242,11 @@ GitHub Actions 自动构建 → 下载 artifact：JegoTidy-dylib、build.log
    ↓
 操作 App，抓 dump → 粘贴回对话
 ```
+
+> **CI 挂了先看 build.log 的第一条 error**：clang 停在第一个硬错误，
+> 修完一个不代表只剩一个 —— 修完**再跑一遍 preflight**，然后再推。
+> 若某条 error 是 preflight 该抓却没抓到的，**先去 tools/ 补规则 + 补自证样本**，
+> 再修 Tweak.xm。否则下一轮还会栽在同一个盲区上。
 
 ### 首次推送到 GitHub（GitHub Desktop，只需做一次）
 
@@ -486,6 +500,7 @@ GitHub Desktop 左下角确认当前分支是 `main` 且已 Push。
 |---|---|
 | 覆写用 `class_addMethod` 加在**子类**上 | `layoutSubviews` / `setHidden:` 都是 `UIView` 的方法；改继承来的 `Method` 会波及全 App 每一个视图 |
 | **父实现按类各存一份**（`JTBaseIMPForOwner` 通用回查），不用全局单份 | 白名单里 4 个是 `UICollectionViewCell` 子类，它们继承的 `layoutSubviews` 来自 `UICollectionViewCell` 而非 `UIView`。统一取 `[UIView …]` 的 IMP 转发会**绕过 cell 自己的布局逻辑**，把 cell 画错 |
+| 父实现存进 **C 结构体定长数组**（`JTBaseIMPTable`），不用 `NSMutableDictionary` | 键是 `Class` —— 对象指针。塞进字典要 `@((uintptr_t)cls)`、取出要 `(Class)key.unsignedLongLongValue`，而后者是 **ARC 明令禁止的"整数→对象指针"强转**，直接编译失败。表项 ≤ 8 个，定长数组既不需要任何强转，也没有每轮布局的字典分配 |
 | `layoutSubviews` 里**只在确实还是显示状态时才写** `hidden` | 每次布局都无条件写一遍 `hidden` 会把父视图反复标脏 → 布局循环。判一下再写，一轮就收敛 |
 | 停手开关**在覆写内部**检查，且 `JTRestoreAds` **先置位、后恢复** | 顺序反了会出现"换回父实现的瞬间又被旧覆写压回 `hidden=YES`"的窗口 → 用户看到"按了没反应" |
 | 撤销后**清空 base IMP 缓存和已装类名集合** | 不留下"看起来装过、实际没装"的错觉；也允许之后重新安装 |
@@ -559,7 +574,7 @@ JegoTidy/
 │   └── 第 12c-3 节               ⑤ 粘性隐藏（layoutSubviews + setHidden: 两份覆写）
 ├── Makefile / control / *.plist Theos 工程文件
 ├── .github/workflows/build.yml  CI：macos-latest + Theos + ldid
-├── tools/                       静态审计（preflight 四项）+ 崩溃报告解析（ips.py）
+├── tools/                       静态审计（preflight 五项规则 + 检查器自证）+ 崩溃报告解析（ips.py）
 ├── docs/rules-spec.md           tab 移除的两条路径设计（v0.2 期间写的，结论已落到 12b 节）
 └── README.md
 ```
