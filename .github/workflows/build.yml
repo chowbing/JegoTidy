@@ -1,0 +1,66 @@
+name: Build JegoTidy dylib
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:   # 允许在 GitHub 网页手动触发（不 push 也能重跑）
+
+jobs:
+  build:
+    runs-on: macos-latest   # Xcode 自带 clang，原生支持 arm64-apple-darwin 目标，比 ubuntu 稳得多
+    env:
+      THEOS: ${{ github.workspace }}/theos
+      THEOS_NO_AUTO_SIGN: 1   # 尽量跳过自签；但实测该 Theos 版本仍会调 ldid，故下面显式装 ldid
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos + iOS SDK + ldid
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          curl -fsSL https://github.com/theos/sdks/archive/master.zip -o /tmp/sdk.zip
+          unzip -q /tmp/sdk.zip -d /tmp/sdkextract
+          # theos/sdks 的 zip 解压出 sdks-master/ 嵌套目录；Theos 要的是 $THEOS/sdks/iPhoneOS.sdk 直接挂在下面
+          mkdir -p "$THEOS/sdks"
+          mv /tmp/sdkextract/sdks-master/* "$THEOS/sdks/"
+          # macOS runner 无自带 ldid；Theos 签名步骤需要它（否则编好的 dylib 在签名步被删，构建报 Error 127）
+          brew install ldid
+          echo "---- SDK 目录 ----"; ls "$THEOS/sdks"
+          echo "---- ldid ----"; which ldid
+
+      - name: Static preflight audit
+        continue-on-error: true
+        run: |
+          python3 tools/preflight.py Tweak.xm || true
+
+      - name: Build dylib (verbose, log to file)
+        continue-on-error: true   # 失败也继续，保证下方日志产物能上传
+        run: |
+          make messages=yes 2>&1 | tee build.log
+
+      - name: Show hard errors
+        if: always()
+        run: grep -n "error:" build.log || echo "(no hard error)"
+
+      - name: Inspect result
+        if: always()
+        run: |
+          echo "---- .theos dylibs ----"
+          find .theos -name '*.dylib' 2>/dev/null || true
+
+      - name: Upload build log
+        if: always()   # 不论成败都上传日志
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+
+      - name: Upload dylib
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: JegoTidy-dylib
+          path: |
+            .theos/obj/debug/JegoTidy.dylib
+            .theos/obj/JegoTidy.dylib

@@ -1,0 +1,9 @@
+# Theos 构建产物（CI 产出，不进仓库）
+.theos/
+obj/
+packages/
+build.log
+*.dylib
+
+# macOS
+.DS_Store
